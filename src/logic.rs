@@ -1,5 +1,5 @@
 use crate::app_state::{self, ChatMessage, StateCmd};
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, LanguageEncoding};
 use crate::ipmsg_core;
 use once_cell::sync::OnceCell;
 use once_cell::sync::Lazy;
@@ -361,12 +361,21 @@ pub fn get_config() -> AppConfig {
     config::load_config()
 }
 
-pub fn save_settings(username: String, group: String) -> Result<(), String> {
+pub fn save_settings(
+    username: String,
+    group: String,
+    language: LanguageEncoding,
+) -> Result<(), String> {
     let mut current = config::load_config();
     current.user.username = username.clone();
     current.user.group = group.clone();
+    current.language = language;
     config::save_config(&current).map_err(|e| e.to_string())?;
 
+    ipmsg_core::set_text_encoding(match language {
+        LanguageEncoding::Utf8 => ipmsg_core::TextEncoding::Utf8,
+        LanguageEncoding::Gb18030 => ipmsg_core::TextEncoding::Gb18030,
+    });
     ipmsg_core::set_user_info(&username, &group);
     if let Some(handle) = RUNTIME_HANDLE.get() {
         handle.spawn(async move {

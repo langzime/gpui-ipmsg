@@ -1,4 +1,5 @@
 use super::ChatShell;
+use crate::config::LanguageEncoding;
 use crate::logic;
 use gpui::*;
 use gpui::prelude::FluentBuilder;
@@ -16,6 +17,7 @@ struct SettingsWindowView {
     group_input: Entity<InputState>,
     username: String,
     group: String,
+    language: LanguageEncoding,
     status_text: String,
     _subscriptions: Vec<Subscription>,
 }
@@ -25,6 +27,7 @@ impl SettingsWindowView {
         let config = logic::get_config();
         let username = config.user.username;
         let group = config.user.group;
+        let language = config.language;
 
         let username_input = cx.new(|cx| InputState::new(window, cx).placeholder("昵称"));
         let group_input = cx.new(|cx| InputState::new(window, cx).placeholder("分组"));
@@ -37,6 +40,7 @@ impl SettingsWindowView {
             group_input,
             username,
             group,
+            language,
             status_text: String::new(),
             _subscriptions: Vec::new(),
         };
@@ -76,10 +80,15 @@ impl SettingsWindowView {
             cx.notify();
             return;
         }
-        match logic::save_settings(username, group) {
+        match logic::save_settings(username, group, self.language) {
             Ok(()) => self.status_text = "设置已保存并已广播上线信息".to_string(),
             Err(error) => self.status_text = format!("保存失败: {}", error),
         }
+        cx.notify();
+    }
+
+    fn set_language(&mut self, language: LanguageEncoding, cx: &mut Context<Self>) {
+        self.language = language;
         cx.notify();
     }
 }
@@ -118,6 +127,50 @@ impl Render for SettingsWindowView {
                     .child(Input::new(&self.username_input))
                     .child(div().text_sm().child("分组"))
                     .child(Input::new(&self.group_input))
+                    .child(div().text_sm().child("语言设置"))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(
+                                if self.language == LanguageEncoding::Utf8 {
+                                    Button::new("lang-utf8")
+                                        .small()
+                                        .primary()
+                                        .label("UTF-8")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_language(LanguageEncoding::Utf8, cx);
+                                        }))
+                                } else {
+                                    Button::new("lang-utf8")
+                                        .small()
+                                        .ghost()
+                                        .label("UTF-8")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_language(LanguageEncoding::Utf8, cx);
+                                        }))
+                                },
+                            )
+                            .child(
+                                if self.language == LanguageEncoding::Gb18030 {
+                                    Button::new("lang-gb18030")
+                                        .small()
+                                        .primary()
+                                        .label("GB18030")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_language(LanguageEncoding::Gb18030, cx);
+                                        }))
+                                } else {
+                                    Button::new("lang-gb18030")
+                                        .small()
+                                        .ghost()
+                                        .label("GB18030")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_language(LanguageEncoding::Gb18030, cx);
+                                        }))
+                                },
+                            ),
+                    )
                     .child(
                         div()
                             .h_flex()
@@ -147,6 +200,11 @@ impl Render for SettingsWindowView {
 impl ChatShell {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
+        let avatar_top_offset = if cfg!(target_os = "macos") {
+            px(20.)
+        } else {
+            px(0.)
+        };
 
         div()
             .v_flex()
@@ -160,6 +218,7 @@ impl ChatShell {
                     .h_flex()
                     .w(px(36.))
                     .h(px(36.))
+                    .mt(avatar_top_offset)
                     .flex_none()
                     .rounded_md()
                     .bg(theme.primary)

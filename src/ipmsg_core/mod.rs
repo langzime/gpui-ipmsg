@@ -2,7 +2,7 @@
 pub mod protocol;
 use protocol::*;
 use anyhow::{anyhow, Result};
-use encoding_rs::GB18030;
+use encoding_rs::{Encoding, GB18030, UTF_8};
 use get_if_addrs::get_if_addrs;
 use log::{info, warn};
 use once_cell::sync::Lazy;
@@ -27,6 +27,40 @@ pub struct Packet {
     pub extra: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEncoding {
+    Utf8,
+    Gb18030,
+}
+
+static TEXT_ENCODING: Lazy<RwLock<TextEncoding>> = Lazy::new(|| RwLock::new(TextEncoding::Gb18030));
+
+fn current_text_encoding() -> TextEncoding {
+    *TEXT_ENCODING.read().unwrap()
+}
+
+fn current_codec() -> &'static Encoding {
+    match current_text_encoding() {
+        TextEncoding::Utf8 => UTF_8,
+        TextEncoding::Gb18030 => GB18030,
+    }
+}
+
+fn encode_text(s: &str) -> Vec<u8> {
+    let (buf, _, _) = current_codec().encode(s);
+    buf.into_owned()
+}
+
+fn decode_text(buf: &[u8]) -> String {
+    let (s, _, _) = current_codec().decode(buf);
+    s.into_owned()
+}
+
+pub fn set_text_encoding(encoding: TextEncoding) {
+    let mut current = TEXT_ENCODING.write().unwrap();
+    *current = encoding;
+}
+
 impl Packet {
     pub fn encode(&self) -> Vec<u8> {
         let s = format!(
@@ -39,13 +73,12 @@ impl Packet {
             self.extra
         );
         info!("encode: {:?} ", s);
-        let (buf, _, _) = GB18030.encode(&s);
-        buf.into_owned()
+        encode_text(&s)
     }
 }
 
 pub fn parse_packet(buf: &[u8]) -> Result<Packet> {
-    let (s, _, _) = GB18030.decode(buf);
+    let s = decode_text(buf);
     info!("parse: {:?} ", s);
     let parts = s.splitn(6, ':').collect::<Vec<_>>();
     if parts.len() < 5 {
@@ -1204,7 +1237,7 @@ where
         
         // Parse header: filename:size:type:attrs...
         // Decode header string (GB18030 usually)
-        let (header_str, _, _) = GB18030.decode(&header_buf);
+        let header_str = decode_text(&header_buf);
         let parts: Vec<&str> = header_str.split(':').collect();
         
         if parts.len() < 3 {
@@ -1321,7 +1354,7 @@ async fn write_dir_header(
     header.push(':');
     header.push_str(&format!("{:x}={:x}", IPMSG_FILE_MTIME, ts));
     header.push(':');
-    let (header_bytes, _, _) = GB18030.encode(&header);
+    let header_bytes = encode_text(&header);
     let header_len = header_bytes.len();
     let total_len = header_len + 4;
     let len_hex = format!("{:0>4x}", total_len);

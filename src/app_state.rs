@@ -1,5 +1,8 @@
 use crate::config;
-use crate::ipmsg_core::{Event, detect_self_addr, protocol::PORT, set_user_info, start_ipmsg};
+use crate::ipmsg_core::{
+    Event, TextEncoding, detect_self_addr, protocol::PORT, set_text_encoding, set_user_info,
+    start_ipmsg,
+};
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -409,6 +412,10 @@ pub fn init_state() {
     let (tx, rx) = mpsc::channel(1024);
     let _ = STATE_CMD_TX.set(tx);
     let current_config = config::load_config();
+    set_text_encoding(match current_config.language {
+        config::LanguageEncoding::Utf8 => TextEncoding::Utf8,
+        config::LanguageEncoding::Gb18030 => TextEncoding::Gb18030,
+    });
     set_user_info(&current_config.user.username, &current_config.user.group);
 
     tokio::spawn(async move {

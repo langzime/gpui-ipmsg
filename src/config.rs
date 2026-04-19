@@ -2,6 +2,20 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageEncoding {
+    #[serde(rename = "UTF-8")]
+    Utf8,
+    #[serde(rename = "GB18030")]
+    Gb18030,
+}
+
+impl Default for LanguageEncoding {
+    fn default() -> Self {
+        Self::Gb18030
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserConfig {
     pub username: String,
@@ -11,6 +25,8 @@ pub struct UserConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub user: UserConfig,
+    #[serde(default)]
+    pub language: LanguageEncoding,
 }
 
 impl Default for AppConfig {
@@ -20,6 +36,7 @@ impl Default for AppConfig {
                 username: whoami::username(),
                 group: "自己".to_string(),
             },
+            language: LanguageEncoding::Gb18030,
         }
     }
 }
