@@ -1,5 +1,7 @@
 # gpui-ipmsg
 
+[English README](./README.en.md)
+
 基于 Rust + [GPUI](https://github.com/zed-industries/zed) 实现的局域网飞鸽（IP Messenger）客户端，支持文字聊天与文件/文件夹传输。
 
 ## 功能特性
