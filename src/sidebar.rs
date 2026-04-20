@@ -203,7 +203,7 @@ impl ChatShell {
         let avatar_top_offset = if cfg!(target_os = "macos") {
             px(20.)
         } else {
-            px(0.)
+            px(30.)
         };
 
         div()
