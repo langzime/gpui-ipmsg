@@ -18,20 +18,18 @@ fn main() {
     app.run(|cx| {
         gpui_component::init(cx);
 
-        cx.spawn(async move |cx| {
-            let mut options = WindowOptions::default();
-            options.titlebar = Some(TitlebarOptions {
-                title: None,
-                appears_transparent: true,
-                traffic_light_position: None,
-            });
+        let mut options = WindowOptions::default();
+        options.window_bounds = Some(WindowBounds::centered(size(px(800.), px(600.)), cx));
+        options.titlebar = Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: None,
+        });
 
-            cx.open_window(options, |window, cx| {
-                let view = cx.new(|cx| ChatShell::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            })
-            .expect("failed to open window");
+        cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ChatShell::new(window, cx));
+            cx.new(|cx| Root::new(view, window, cx))
         })
-        .detach();
+        .expect("failed to open window");
     });
 }
