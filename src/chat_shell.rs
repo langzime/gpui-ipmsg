@@ -59,6 +59,21 @@ pub(crate) struct ChatShell {
 }
 
 impl ChatShell {
+    fn clear_selected_unread_if_needed(&mut self) {
+        if !self.stick_to_bottom {
+            return;
+        }
+        if let Some(conv) = self.conversations.get_mut(self.selected_conversation) {
+            if conv.unread == 0 {
+                return;
+            }
+            conv.unread = 0;
+            if let Ok(addr) = conv.id.parse::<SocketAddr>() {
+                app_state::dispatch_cmd(app_state::StateCmd::ClearUnread { addr });
+            }
+        }
+    }
+
 
     fn is_message_scroll_near_bottom(&self) -> bool {
         // In this scroll model, current offset is negative and max_offset is positive.
@@ -134,6 +149,7 @@ impl ChatShell {
                     if should_scroll_bottom && this.stick_to_bottom {
                         this.pending_scroll_to_bottom_frames = 2;
                     }
+                    this.clear_selected_unread_if_needed();
                     cx.notify();
                 }
             });
@@ -411,6 +427,7 @@ impl Drop for ChatShell {
 impl Render for ChatShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.stick_to_bottom = self.is_message_scroll_near_bottom();
+        self.clear_selected_unread_if_needed();
         if self.pending_scroll_to_bottom_frames > 0 {
             self.message_scroll_handle.scroll_to_bottom();
             self.pending_scroll_to_bottom_frames -= 1;
