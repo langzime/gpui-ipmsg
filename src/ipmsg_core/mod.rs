@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -126,6 +126,46 @@ fn parse_entry_extra(username: &str, extra: &str) -> (String, String) {
     (final_nick, final_group)
 }
 
+fn parse_u32_auto_radix(s: &str) -> u32 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16).unwrap_or(0);
+    }
+    let has_hex_alpha = s
+        .as_bytes()
+        .iter()
+        .any(|b| (*b >= b'a' && *b <= b'f') || (*b >= b'A' && *b <= b'F'));
+    if has_hex_alpha {
+        return u32::from_str_radix(s, 16).unwrap_or(0);
+    }
+    s.parse::<u32>()
+        .or_else(|_| u32::from_str_radix(s, 16))
+        .unwrap_or(0)
+}
+
+fn parse_u64_auto_radix(s: &str) -> u64 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).unwrap_or(0);
+    }
+    let has_hex_alpha = s
+        .as_bytes()
+        .iter()
+        .any(|b| (*b >= b'a' && *b <= b'f') || (*b >= b'A' && *b <= b'F'));
+    if has_hex_alpha {
+        return u64::from_str_radix(s, 16).unwrap_or(0);
+    }
+    s.parse::<u64>()
+        .or_else(|_| u64::from_str_radix(s, 16))
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     Online { user: String, group: String, host: String, addr: SocketAddr },
@@ -235,6 +275,30 @@ struct FileEntry {
 static FILE_TABLE: Lazy<Mutex<HashMap<(u32, u32), FileEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static FILE_ID_SEQ: AtomicU32 = AtomicU32::new(1);
+static SEND_CANCEL_FLAGS: Lazy<Mutex<HashMap<(SocketAddr, u32, u32), Arc<AtomicBool>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn send_cancel_token(peer: SocketAddr, packet_no: u32, file_id: u32) -> Arc<AtomicBool> {
+    let mut flags = SEND_CANCEL_FLAGS.lock().unwrap();
+    flags
+        .entry((peer, packet_no, file_id))
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
+fn clear_send_cancel_token(peer: SocketAddr, packet_no: u32, file_id: u32) {
+    SEND_CANCEL_FLAGS
+        .lock()
+        .unwrap()
+        .remove(&(peer, packet_no, file_id));
+}
+
+pub fn cancel_send(to: SocketAddr, packet_no: u32, file_id: u32) -> bool {
+    let removed = FILE_TABLE.lock().unwrap().remove(&(packet_no, file_id)).is_some();
+    let token = send_cancel_token(to, packet_no, file_id);
+    token.store(true, Ordering::SeqCst);
+    removed
+}
 
 impl Service {
     pub async fn new() -> Result<Self> {
@@ -339,13 +403,11 @@ impl Service {
                                                                 continue;
                                                             }
                                                             let id_str = parts[0].trim();
-                                                            let fid = u32::from_str_radix(id_str, 16)
-                                                                .or_else(|_| id_str.parse::<u32>())
-                                                                .unwrap_or(0);
+                                                            let fid = parse_u32_auto_radix(id_str);
                                                             let name = parts[1].replace("::", ":");
-                                                            let size = u64::from_str_radix(parts[2].trim(), 16).unwrap_or(0);
+                                                            let size = parse_u64_auto_radix(parts[2].trim());
                                                             let attr_hex = parts[4].trim();
-                                                            let attr_val = u32::from_str_radix(attr_hex, 16).unwrap_or(0);
+                                                            let attr_val = parse_u32_auto_radix(attr_hex);
                                                             let file_type = attr_val & 0x000000ff;
                                                             let is_dir = file_type == IPMSG_FILE_DIR;
                                                             files.push((fid, name, size, is_dir));
@@ -1137,6 +1199,13 @@ where
         total,
         save_path
     );
+    if expected_size > 0 && total < expected_size {
+        return Err(anyhow!(
+            "incomplete file transfer: expected {} bytes, got {}",
+            expected_size,
+            total
+        ));
+    }
     Ok(total)
 }
 
@@ -1152,7 +1221,7 @@ where
     F: FnMut(u64) + Send,
 {
     info!("recv_file start from {} packet_no={} file_id={}", from, packet_no, file_id);
-    recv_file_once(
+    let first_try = recv_file_once(
         from,
         packet_no,
         file_id,
@@ -1161,7 +1230,23 @@ where
         expected_size,
         &mut on_progress,
     )
-    .await?;
+    .await;
+    if first_try.is_err() {
+        info!(
+            "recv_file retry with decimal mode from {} packet_no={} file_id={}",
+            from, packet_no, file_id
+        );
+        recv_file_once(
+            from,
+            packet_no,
+            file_id,
+            &save_path,
+            false, // retry with decimal
+            expected_size,
+            &mut on_progress,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1214,7 +1299,10 @@ where
             let mut b = [0u8; 1];
             let n = reader.read(&mut b).await?;
             if n == 0 {
-                // End of stream
+                // End of stream. If no entry was received, treat it as canceled/unavailable.
+                if is_first_entry {
+                    return Err(anyhow!("no folder data received"));
+                }
                 return Ok(());
             }
             if b[0] == b':' {
@@ -1367,10 +1455,14 @@ async fn write_dir_header(
 fn send_dir_children<'a>(
     stream: &'a mut TcpStream,
     dir: PathBuf,
+    cancel_token: Arc<AtomicBool>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let mut entries = fs::read_dir(&dir).await?;
         while let Some(entry) = entries.next_entry().await? {
+            if cancel_token.load(Ordering::SeqCst) {
+                return Err(anyhow!("send canceled"));
+            }
             let path = entry.path();
             let meta = entry.metadata().await?;
             if meta.is_dir() {
@@ -1385,7 +1477,7 @@ fn send_dir_children<'a>(
                     .and_then(|s| s.to_str())
                     .unwrap_or("dir");
                 write_dir_header(stream, name, IPMSG_FILE_DIR, 0, mtime).await?;
-                send_dir_children(stream, path.clone()).await?;
+                send_dir_children(stream, path.clone(), cancel_token.clone()).await?;
                 write_dir_header(stream, ".", IPMSG_FILE_RETPARENT, 0, 0).await?;
             } else if meta.is_file() {
                 let mtime = meta
@@ -1404,6 +1496,9 @@ fn send_dir_children<'a>(
                 let mut buf = [0u8; 8192];
                 let mut sent: u64 = 0;
                 loop {
+                    if cancel_token.load(Ordering::SeqCst) {
+                        return Err(anyhow!("send canceled"));
+                    }
                     let n = file.read(&mut buf).await?;
                     if n == 0 {
                         break;
@@ -1420,7 +1515,14 @@ fn send_dir_children<'a>(
     })
 }
 
-async fn send_dir_hierarchy(stream: &mut TcpStream, root: &PathBuf) -> Result<()> {
+async fn send_dir_hierarchy(
+    stream: &mut TcpStream,
+    root: &PathBuf,
+    cancel_token: Arc<AtomicBool>,
+) -> Result<()> {
+    if cancel_token.load(Ordering::SeqCst) {
+        return Err(anyhow!("send canceled"));
+    }
     let root_name = root
         .file_name()
         .and_then(|s| s.to_str())
@@ -1433,7 +1535,7 @@ async fn send_dir_hierarchy(stream: &mut TcpStream, root: &PathBuf) -> Result<()
         .map(|d| d.as_secs())
         .unwrap_or(0);
     write_dir_header(stream, root_name, IPMSG_FILE_DIR, 0, mtime).await?;
-    send_dir_children(stream, root.clone()).await?;
+    send_dir_children(stream, root.clone(), cancel_token.clone()).await?;
     write_dir_header(stream, ".", IPMSG_FILE_RETPARENT, 0, 0).await?;
     Ok(())
 }
@@ -1470,6 +1572,11 @@ async fn handle_tcp_file(
             if entry.is_dir {
                 return Ok(());
             }
+            let cancel_token = send_cancel_token(peer_addr, pkt_no, file_id);
+            if cancel_token.load(Ordering::SeqCst) {
+                clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                return Err(anyhow!("send canceled"));
+            }
             let _ = tx.send(Event::FileServingStarted {
                 to: peer_addr,
                 packet_no: pkt_no,
@@ -1481,12 +1588,23 @@ async fn handle_tcp_file(
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
             }
             let mut buf = [0u8; 8192];
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
+            let send_result: Result<()> = async {
+                loop {
+                    if cancel_token.load(Ordering::SeqCst) {
+                        return Err(anyhow!("send canceled"));
+                    }
+                    let n = file.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    stream.write_all(&buf[..n]).await?;
                 }
-                stream.write_all(&buf[..n]).await?;
+                Ok(())
+            }
+            .await;
+            if let Err(err) = send_result {
+                clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                return Err(err);
             }
             info!(
                 "SENDFILE done packet_no={:x} file_id={:x} path='{}'",
@@ -1500,6 +1618,7 @@ async fn handle_tcp_file(
                 file_id,
                 is_dir: false,
             });
+            clear_send_cancel_token(peer_addr, pkt_no, file_id);
         }
         return Ok(());
     }
@@ -1521,13 +1640,23 @@ async fn handle_tcp_file(
         };
         if let Some(entry) = entry {
             if entry.is_dir {
+                let cancel_token = send_cancel_token(peer_addr, pkt_no, file_id);
+                if cancel_token.load(Ordering::SeqCst) {
+                    clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                    return Err(anyhow!("send canceled"));
+                }
                 let _ = tx.send(Event::FileServingStarted {
                     to: peer_addr,
                     packet_no: pkt_no,
                     file_id,
                     is_dir: true,
                 });
-                send_dir_hierarchy(&mut stream, &entry.path).await?;
+                let send_result =
+                    send_dir_hierarchy(&mut stream, &entry.path, cancel_token.clone()).await;
+                if let Err(err) = send_result {
+                    clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                    return Err(err);
+                }
                 info!(
                     "SENDDIR done packet_no={:x} file_id={:x} path='{}'",
                     pkt_no,
@@ -1540,6 +1669,7 @@ async fn handle_tcp_file(
                     file_id,
                     is_dir: true,
                 });
+                clear_send_cancel_token(peer_addr, pkt_no, file_id);
             }
         }
     }

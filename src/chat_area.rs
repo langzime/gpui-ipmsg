@@ -105,7 +105,7 @@ impl ChatShell {
                             .child(status),
                     );
 
-                if is_receiving && !message.from_me {
+                if !message.from_me && !transfer.saved && !transfer.error && !transfer.canceled {
                     let transfer = transfer.clone();
                     status_row = status_row.child(
                         Button::new(format!(
@@ -116,7 +116,21 @@ impl ChatShell {
                         .ghost()
                         .label("取消接收")
                         .on_click(cx.listener(move |this, _, _, _cx| {
-                            this.cancel_transfer(transfer.clone());
+                            this.cancel_transfer(transfer.clone(), false);
+                        })),
+                    );
+                } else if message.from_me && !transfer.saved && !transfer.error && !transfer.canceled {
+                    let transfer = transfer.clone();
+                    status_row = status_row.child(
+                        Button::new(format!(
+                            "cancel-send-{}-{}",
+                            transfer.packet_no, transfer.file_id
+                        ))
+                        .xsmall()
+                        .ghost()
+                        .label("取消发送")
+                        .on_click(cx.listener(move |this, _, _, _cx| {
+                            this.cancel_transfer(transfer.clone(), true);
                         })),
                     );
                 } else if transfer.local_path.is_some() && (message.from_me || transfer.saved) {
@@ -137,7 +151,7 @@ impl ChatShell {
 
                 bubble = bubble.child(status_row);
 
-                if !message.from_me && !transfer.saved {
+                if !message.from_me && !transfer.saved && !transfer.canceled {
                     let transfer = transfer.clone();
                     if is_receiving {
                         if transfer.is_dir {
@@ -295,7 +309,7 @@ impl ChatShell {
                         )
                         .child(
                             resizable_panel()
-                                .size(px(220.))
+                                .size(px(180.))
                                 .size_range(px(180.)..px(420.))
                                 .child(self.render_input_area(window, cx)),
                         ),

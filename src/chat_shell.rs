@@ -52,11 +52,22 @@ pub(crate) struct ChatShell {
     pub(crate) search_text: String,
     pub(crate) compose_text: String,
     last_state_seq: u64,
+    pending_scroll_to_bottom_frames: u8,
+    stick_to_bottom: bool,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
 
 impl ChatShell {
+
+    fn is_message_scroll_near_bottom(&self) -> bool {
+        // In this scroll model, current offset is negative and max_offset is positive.
+        // Near bottom means their sum is near zero (e.g. -6296 + 6296 ~= 0).
+        let current = self.message_scroll_handle.offset().y;
+        let bottom = self.message_scroll_handle.max_offset().y;
+        (current + bottom).abs() <= px(80.)
+    }
+
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let compose_input = cx.new(|cx| {
@@ -77,6 +88,8 @@ impl ChatShell {
             search_text: String::new(),
             compose_text: String::new(),
             last_state_seq: 0,
+            pending_scroll_to_bottom_frames: 0,
+            stick_to_bottom: true,
             _subscriptions: Vec::new(),
             _tasks: Vec::new(),
         };
@@ -109,7 +122,7 @@ impl ChatShell {
         );
         this._subscriptions.push(compose_sub);
 
-        this.refresh_from_state();
+        let _ = this.refresh_from_state();
         this.last_state_seq = app_state::state_seq();
         let poll_task = cx.spawn_in(window, async move |entity, cx| loop {
             cx.background_executor().timer(Duration::from_millis(250)).await;
@@ -117,7 +130,10 @@ impl ChatShell {
             let _ = entity.update_in(cx, |this, _, cx| {
                 if this.last_state_seq != seq {
                     this.last_state_seq = seq;
-                    this.refresh_from_state();
+                    let should_scroll_bottom = this.refresh_from_state();
+                    if should_scroll_bottom && this.stick_to_bottom {
+                        this.pending_scroll_to_bottom_frames = 2;
+                    }
                     cx.notify();
                 }
             });
@@ -172,7 +188,6 @@ impl ChatShell {
         self.compose_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
-        self.message_scroll_handle.scroll_to_bottom();
         cx.notify();
     }
 
@@ -260,11 +275,21 @@ impl ChatShell {
         }
     }
 
-    pub(crate) fn cancel_transfer(&mut self, transfer: FileTransfer) {
-        logic::cancel_download(transfer.from, transfer.packet_no, transfer.file_id);
+    pub(crate) fn cancel_transfer(&mut self, transfer: FileTransfer, from_me: bool) {
+        if from_me {
+            logic::cancel_upload(transfer.from, transfer.packet_no, transfer.file_id);
+        } else {
+            logic::cancel_download(transfer.from, transfer.packet_no, transfer.file_id);
+        }
     }
 
-    fn refresh_from_state(&mut self) {
+    fn refresh_from_state(&mut self) -> bool {
+        let prev_selected_id = self.selected_conversation().map(|c| c.id.clone());
+        let prev_selected_len = prev_selected_id
+            .as_ref()
+            .and_then(|id| self.messages_by_conversation.get(id))
+            .map(std::vec::Vec::len)
+            .unwrap_or(0);
         let users = app_state::list_online_users();
         let messages = app_state::list_messages();
         let unread_counts = app_state::list_unread_counts();
@@ -310,9 +335,6 @@ impl ChatShell {
             } else {
                 message.from
             };
-            if message.is_me && Some(peer) == self_addr {
-                continue;
-            }
             let id = peer.to_string();
             let text = if !message.text.is_empty() {
                 message.text
@@ -332,7 +354,7 @@ impl ChatShell {
                     from_me: message.is_me,
                     text: text.clone(),
                     file: file_data.map(|f| FileTransfer {
-                        from: message.from,
+                        from: if message.is_me { message.to } else { message.from },
                         packet_no: f.packet_no,
                         file_id: f.file_id,
                         name: f.name,
@@ -362,7 +384,6 @@ impl ChatShell {
 
         let mut list: Vec<Conversation> = conversations.into_values().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
-        let prev_selected_id = self.selected_conversation().map(|c| c.id.clone());
         let mut selected_index = 0usize;
         if let Some(selected_id) = prev_selected_id {
             if let Some(index) = list.iter().position(|c| c.id == selected_id) {
@@ -372,6 +393,12 @@ impl ChatShell {
         self.conversations = list;
         self.messages_by_conversation = messages_by_conversation;
         self.selected_conversation = selected_index.min(self.conversations.len().saturating_sub(1));
+        let new_selected_len = self
+            .selected_conversation()
+            .and_then(|c| self.messages_by_conversation.get(&c.id))
+            .map(std::vec::Vec::len)
+            .unwrap_or(0);
+        new_selected_len > prev_selected_len
     }
 }
 
@@ -383,6 +410,14 @@ impl Drop for ChatShell {
 
 impl Render for ChatShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.stick_to_bottom = self.is_message_scroll_near_bottom();
+        if self.pending_scroll_to_bottom_frames > 0 {
+            self.message_scroll_handle.scroll_to_bottom();
+            self.pending_scroll_to_bottom_frames -= 1;
+            if self.pending_scroll_to_bottom_frames > 0 {
+                cx.notify();
+            }
+        }
         let sidebar = self.render_sidebar(cx);
         let conversation_list = self.render_conversation_list(cx);
         let chat_area = self.render_chat_area(window, cx);
@@ -413,7 +448,7 @@ impl Render for ChatShell {
                             h_resizable("chat-content-resizable")
                                 .child(
                                     resizable_panel()
-                                        .size(px(300.))
+                                        .size(px(220.))
                                         .size_range(px(220.)..px(520.))
                                         .child(conversation_list),
                                 )

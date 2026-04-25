@@ -169,6 +169,7 @@ pub fn download_file(
                     from,
                     file_id,
                     packet_no,
+                    target_outgoing: Some(false),
                     progress,
                     file_name: None,
                     local_path: None,
@@ -187,6 +188,7 @@ pub fn download_file(
                     from,
                     file_id,
                     packet_no,
+                    target_outgoing: Some(false),
                     progress: size,
                     file_name: None,
                     local_path: Some(save_path_for_state.clone()),
@@ -200,6 +202,7 @@ pub fn download_file(
                     from,
                     file_id,
                     packet_no,
+                    target_outgoing: Some(false),
                     progress: 0,
                     file_name: None,
                     local_path: None,
@@ -234,6 +237,7 @@ pub fn download_folder(from: SocketAddr, packet_no: u32, file_id: u32, save_path
                     from,
                     file_id,
                     packet_no,
+                    target_outgoing: Some(false),
                     progress,
                     file_name: Some(current_file.clone()),
                     local_path: None,
@@ -253,6 +257,7 @@ pub fn download_folder(from: SocketAddr, packet_no: u32, file_id: u32, save_path
                     from,
                     file_id,
                     packet_no,
+                    target_outgoing: Some(false),
                     progress: 0,
                     file_name: None,
                     local_path: Some(save_path_for_state.clone()),
@@ -266,6 +271,7 @@ pub fn download_folder(from: SocketAddr, packet_no: u32, file_id: u32, save_path
                     from,
                     file_id,
                     packet_no,
+                    target_outgoing: Some(false),
                     progress: 0,
                     file_name: None,
                     local_path: None,
@@ -284,18 +290,35 @@ pub fn cancel_download(from: SocketAddr, packet_no: u32, file_id: u32) {
     let key = download_key(from, packet_no, file_id);
     if let Some(handle) = ACTIVE_DOWNLOADS.lock().unwrap().remove(&key) {
         handle.abort();
-        app_state::dispatch_cmd(StateCmd::UpdateProgress {
-            from,
-            file_id,
-            packet_no,
-            progress: 0,
-            file_name: None,
-            local_path: None,
-            saved: Some(false),
-            error: Some(false),
-            canceled: Some(true),
-        });
     }
+    app_state::dispatch_cmd(StateCmd::UpdateProgress {
+        from,
+        file_id,
+        packet_no,
+        target_outgoing: Some(false),
+        progress: 0,
+        file_name: None,
+        local_path: None,
+        saved: Some(false),
+        error: Some(false),
+        canceled: Some(true),
+    });
+}
+
+pub fn cancel_upload(to: SocketAddr, packet_no: u32, file_id: u32) {
+    let _ = ipmsg_core::cancel_send(to, packet_no, file_id);
+    app_state::dispatch_cmd(StateCmd::UpdateProgress {
+        from: to,
+        file_id,
+        packet_no,
+        target_outgoing: Some(true),
+        progress: 0,
+        file_name: None,
+        local_path: None,
+        saved: Some(false),
+        error: Some(false),
+        canceled: Some(true),
+    });
 }
 
 pub fn open_in_folder(path: String, is_dir: bool) {

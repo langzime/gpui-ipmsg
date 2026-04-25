@@ -82,6 +82,7 @@ pub enum StateCmd {
         from: SocketAddr,
         file_id: u32,
         packet_no: u32,
+        target_outgoing: Option<bool>,
         progress: u64,
         file_name: Option<String>,
         local_path: Option<String>,
@@ -211,20 +212,12 @@ pub async fn run_state_manager(mut rx: mpsc::Receiver<StateCmd>) {
                         time: "现在".into(),
                         file: None,
                     });
-                    let group = state
-                        .online_users
-                        .get(&from_norm)
-                        .map(|u| u.group.clone())
-                        .unwrap_or_default();
-                    state.online_users.insert(
-                        from_norm,
-                        OnlineUser {
+                    state.online_users.entry(from_norm).or_insert_with(|| OnlineUser {
                         name: user,
-                        group,
+                        group: String::new(),
                         host,
                         addr: from_norm,
-                    },
-                    );
+                    });
                     *state.unread_counts.entry(from_norm).or_insert(0) += 1;
                     changed = true;
                     should_persist = true;
@@ -267,20 +260,12 @@ pub async fn run_state_manager(mut rx: mpsc::Receiver<StateCmd>) {
                             sending: false,
                         }),
                     });
-                    let group = state
-                        .online_users
-                        .get(&from_norm)
-                        .map(|u| u.group.clone())
-                        .unwrap_or_default();
-                    state.online_users.insert(
-                        from_norm,
-                        OnlineUser {
+                    state.online_users.entry(from_norm).or_insert_with(|| OnlineUser {
                         name: user,
-                        group,
+                        group: String::new(),
                         host,
                         addr: from_norm,
-                    },
-                    );
+                    });
                     *state.unread_counts.entry(from_norm).or_insert(0) += 1;
                     changed = true;
                     should_persist = true;
@@ -345,6 +330,7 @@ pub async fn run_state_manager(mut rx: mpsc::Receiver<StateCmd>) {
                 from,
                 file_id,
                 packet_no,
+                target_outgoing,
                 progress,
                 file_name,
                 local_path,
@@ -354,11 +340,18 @@ pub async fn run_state_manager(mut rx: mpsc::Receiver<StateCmd>) {
             } => {
                 let from_norm = normalize_addr(from);
                 for message in state.messages.iter_mut().rev() {
+                    if let Some(target) = target_outgoing
+                        && message.is_me != target
+                    {
+                        continue;
+                    }
                     if let Some(file) = &mut message.file {
-                        if message.from == from_norm
-                            && file.packet_no == packet_no
-                            && file.file_id == file_id
-                        {
+                        let matched_peer = if message.is_me {
+                            normalize_addr(message.to) == from_norm
+                        } else {
+                            message.from == from_norm
+                        };
+                        if matched_peer && file.packet_no == packet_no && file.file_id == file_id {
                             file.received = progress;
                             if let Some(name) = file_name {
                                 file.current_file = Some(name);
