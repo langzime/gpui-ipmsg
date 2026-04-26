@@ -1,5 +1,5 @@
 use super::ChatShell;
-use crate::config::LanguageEncoding;
+use crate::config::{LanguageEncoding, UiLanguage};
 use crate::logic;
 use gpui::*;
 use gpui::prelude::FluentBuilder;
@@ -18,6 +18,7 @@ struct SettingsWindowView {
     username: String,
     group: String,
     language: LanguageEncoding,
+    ui_language: UiLanguage,
     status_text: String,
     _subscriptions: Vec<Subscription>,
 }
@@ -28,9 +29,12 @@ impl SettingsWindowView {
         let username = config.user.username;
         let group = config.user.group;
         let language = config.language;
+        let ui_language = config.ui_language;
 
-        let username_input = cx.new(|cx| InputState::new(window, cx).placeholder("昵称"));
-        let group_input = cx.new(|cx| InputState::new(window, cx).placeholder("分组"));
+        let username_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("settings.username").to_string()));
+        let group_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("settings.group").to_string()));
 
         username_input.update(cx, |state, cx| state.set_value(&username, window, cx));
         group_input.update(cx, |state, cx| state.set_value(&group, window, cx));
@@ -41,6 +45,7 @@ impl SettingsWindowView {
             username,
             group,
             language,
+            ui_language,
             status_text: String::new(),
             _subscriptions: Vec::new(),
         };
@@ -76,19 +81,27 @@ impl SettingsWindowView {
         let username = self.username.trim().to_string();
         let group = self.group.trim().to_string();
         if username.is_empty() {
-            self.status_text = "昵称不能为空".to_string();
+            self.status_text = t!("status.username_required").to_string();
             cx.notify();
             return;
         }
-        match logic::save_settings(username, group, self.language) {
-            Ok(()) => self.status_text = "设置已保存并已广播上线信息".to_string(),
-            Err(error) => self.status_text = format!("保存失败: {}", error),
+        match logic::save_settings(username, group, self.language, self.ui_language) {
+            Ok(()) => self.status_text = t!("status.saved_and_broadcasted").to_string(),
+            Err(error) => {
+                self.status_text = t!("status.save_failed", error = error).to_string();
+            }
         }
         cx.notify();
     }
 
-    fn set_language(&mut self, language: LanguageEncoding, cx: &mut Context<Self>) {
+    fn set_encoding(&mut self, language: LanguageEncoding, cx: &mut Context<Self>) {
         self.language = language;
+        cx.notify();
+    }
+
+    fn set_ui_language(&mut self, ui_language: UiLanguage, cx: &mut Context<Self>) {
+        self.ui_language = ui_language;
+        rust_i18n::set_locale(ui_language.as_locale());
         cx.notify();
     }
 }
@@ -114,7 +127,7 @@ impl Render for SettingsWindowView {
                         .h_full()
                         .items_center()
                         .px_1()
-                        .child(div().text_sm().font_semibold().child("设置")),
+                        .child(div().text_sm().font_semibold().child(t!("settings.title").to_string())),
                 ),
             )
             .child(
@@ -123,11 +136,11 @@ impl Render for SettingsWindowView {
                     .flex_1()
                     .p_4()
                     .gap_3()
-                    .child(div().text_sm().child("昵称"))
+                    .child(div().text_sm().child(t!("settings.username").to_string()))
                     .child(Input::new(&self.username_input))
-                    .child(div().text_sm().child("分组"))
+                    .child(div().text_sm().child(t!("settings.group").to_string()))
                     .child(Input::new(&self.group_input))
-                    .child(div().text_sm().child("语言设置"))
+                    .child(div().text_sm().child(t!("settings.encoding").to_string()))
                     .child(
                         div()
                             .h_flex()
@@ -139,7 +152,7 @@ impl Render for SettingsWindowView {
                                         .primary()
                                         .label("UTF-8")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_language(LanguageEncoding::Utf8, cx);
+                                            this.set_encoding(LanguageEncoding::Utf8, cx);
                                         }))
                                 } else {
                                     Button::new("lang-utf8")
@@ -147,7 +160,7 @@ impl Render for SettingsWindowView {
                                         .ghost()
                                         .label("UTF-8")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_language(LanguageEncoding::Utf8, cx);
+                                            this.set_encoding(LanguageEncoding::Utf8, cx);
                                         }))
                                 },
                             )
@@ -158,7 +171,7 @@ impl Render for SettingsWindowView {
                                         .primary()
                                         .label("GB18030")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_language(LanguageEncoding::Gb18030, cx);
+                                            this.set_encoding(LanguageEncoding::Gb18030, cx);
                                         }))
                                 } else {
                                     Button::new("lang-gb18030")
@@ -166,7 +179,51 @@ impl Render for SettingsWindowView {
                                         .ghost()
                                         .label("GB18030")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_language(LanguageEncoding::Gb18030, cx);
+                                            this.set_encoding(LanguageEncoding::Gb18030, cx);
+                                        }))
+                                },
+                            ),
+                    )
+                    .child(div().text_sm().child(t!("settings.ui_language").to_string()))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(
+                                if self.ui_language == UiLanguage::ZhCn {
+                                    Button::new("ui-lang-zh-cn")
+                                        .small()
+                                        .primary()
+                                        .label(t!("settings.ui_language_zh_cn").to_string())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_ui_language(UiLanguage::ZhCn, cx);
+                                        }))
+                                } else {
+                                    Button::new("ui-lang-zh-cn")
+                                        .small()
+                                        .ghost()
+                                        .label(t!("settings.ui_language_zh_cn").to_string())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_ui_language(UiLanguage::ZhCn, cx);
+                                        }))
+                                },
+                            )
+                            .child(
+                                if self.ui_language == UiLanguage::En {
+                                    Button::new("ui-lang-en")
+                                        .small()
+                                        .primary()
+                                        .label(t!("settings.ui_language_en").to_string())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_ui_language(UiLanguage::En, cx);
+                                        }))
+                                } else {
+                                    Button::new("ui-lang-en")
+                                        .small()
+                                        .ghost()
+                                        .label(t!("settings.ui_language_en").to_string())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_ui_language(UiLanguage::En, cx);
                                         }))
                                 },
                             ),
@@ -179,7 +236,7 @@ impl Render for SettingsWindowView {
                                 Button::new("save-settings")
                                     .small()
                                     .primary()
-                                    .label("保存")
+                                    .label(t!("settings.save").to_string())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.save(cx);
                                     })),

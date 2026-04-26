@@ -1,5 +1,5 @@
 use crate::app_state::{self, ChatMessage, StateCmd};
-use crate::config::{self, AppConfig, LanguageEncoding};
+use crate::config::{self, AppConfig, LanguageEncoding, UiLanguage};
 use crate::ipmsg_core;
 use once_cell::sync::OnceCell;
 use once_cell::sync::Lazy;
@@ -58,7 +58,7 @@ pub fn send_text(to: SocketAddr, text: String) {
                     to,
                     is_me: true,
                     text,
-                    time: "现在".to_string(),
+                    time: t!("time.now").to_string(),
                     file: None,
                 };
                 app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
@@ -84,7 +84,7 @@ pub fn send_files(to: SocketAddr, paths: Vec<String>) {
                         to,
                         is_me: true,
                         text: String::new(),
-                        time: "现在".to_string(),
+                        time: t!("time.now").to_string(),
                         file: Some(app_state::FileInfo {
                             packet_no: item.packet_no,
                             file_id: item.file_id,
@@ -122,8 +122,8 @@ pub fn send_folder(to: SocketAddr, path: String) {
                     from: me.addr,
                     to,
                     is_me: true,
-                    text: format!("[文件夹] {}", item.name),
-                    time: "现在".to_string(),
+                    text: t!("file.folder_prefix", name = item.name.clone()).to_string(),
+                    time: t!("time.now").to_string(),
                     file: Some(app_state::FileInfo {
                         packet_no: item.packet_no,
                         file_id: item.file_id,
@@ -388,12 +388,15 @@ pub fn save_settings(
     username: String,
     group: String,
     language: LanguageEncoding,
+    ui_language: UiLanguage,
 ) -> Result<(), String> {
     let mut current = config::load_config();
     current.user.username = username.clone();
     current.user.group = group.clone();
     current.language = language;
+    current.ui_language = ui_language;
     config::save_config(&current).map_err(|e| e.to_string())?;
+    rust_i18n::set_locale(ui_language.as_locale());
 
     ipmsg_core::set_text_encoding(match language {
         LanguageEncoding::Utf8 => ipmsg_core::TextEncoding::Utf8,

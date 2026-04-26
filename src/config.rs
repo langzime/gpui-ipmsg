@@ -16,6 +16,39 @@ impl Default for LanguageEncoding {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum UiLanguage {
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "en")]
+    En,
+}
+
+impl UiLanguage {
+    pub fn as_locale(self) -> &'static str {
+        match self {
+            Self::ZhCn => "zh-CN",
+            Self::En => "en",
+        }
+    }
+}
+
+fn detect_system_ui_language() -> UiLanguage {
+    let locale = sys_locale::get_locale().unwrap_or_default().to_lowercase();
+    let normalized = locale.replace('_', "-");
+    if normalized.starts_with("zh") {
+        UiLanguage::ZhCn
+    } else {
+        UiLanguage::En
+    }
+}
+
+impl Default for UiLanguage {
+    fn default() -> Self {
+        detect_system_ui_language()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserConfig {
     pub username: String,
@@ -27,6 +60,8 @@ pub struct AppConfig {
     pub user: UserConfig,
     #[serde(default)]
     pub language: LanguageEncoding,
+    #[serde(default)]
+    pub ui_language: UiLanguage,
 }
 
 impl Default for AppConfig {
@@ -37,6 +72,7 @@ impl Default for AppConfig {
                 group: "自己".to_string(),
             },
             language: LanguageEncoding::Gb18030,
+            ui_language: UiLanguage::default(),
         }
     }
 }

@@ -21,3 +21,5 @@ tokio = { version = "1", features = ["full"] }
 whoami = "1.6"
 rfd = "0.15"
 toml = "0.8"
+rust-i18n = "4.0.0"
+sys-locale = "0.3"

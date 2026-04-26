@@ -209,7 +209,7 @@ pub async fn run_state_manager(mut rx: mpsc::Receiver<StateCmd>) {
                         to,
                         is_me: false,
                         text,
-                        time: "现在".into(),
+                        time: t!("time.now").to_string(),
                         file: None,
                     });
                     state.online_users.entry(from_norm).or_insert_with(|| OnlineUser {
@@ -235,16 +235,16 @@ pub async fn run_state_manager(mut rx: mpsc::Receiver<StateCmd>) {
                     let from_norm = normalize_addr(from);
                     let to = state.self_addr.unwrap_or_else(default_self_addr);
                     let text = if is_dir {
-                        format!("[文件夹] {}", name)
+                        t!("file.folder_prefix", name = name.clone()).to_string()
                     } else {
-                        format!("[文件] {} ({})", name, format_size(size))
+                        t!("file.file_with_size", name = name.clone(), size = format_size(size)).to_string()
                     };
                     state.messages.push(ChatMessage {
                         from: from_norm,
                         to,
                         is_me: false,
                         text,
-                        time: "现在".into(),
+                        time: t!("time.now").to_string(),
                         file: Some(FileInfo {
                             packet_no,
                             file_id,
@@ -405,6 +405,7 @@ pub fn init_state() {
     let (tx, rx) = mpsc::channel(1024);
     let _ = STATE_CMD_TX.set(tx);
     let current_config = config::load_config();
+    rust_i18n::set_locale(current_config.ui_language.as_locale());
     set_text_encoding(match current_config.language {
         config::LanguageEncoding::Utf8 => TextEncoding::Utf8,
         config::LanguageEncoding::Gb18030 => TextEncoding::Gb18030,

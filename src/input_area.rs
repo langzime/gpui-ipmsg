@@ -21,7 +21,7 @@ impl ChatShell {
                 .rounded_lg()
                 .px_2()
                 .h(px(24.))
-                .label("发送")
+                .label(t!("chat.send").to_string())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.send_current_message(window, cx);
                 }))
@@ -37,7 +37,7 @@ impl ChatShell {
                 .text_color(theme.muted_foreground.opacity(0.85))
                 .border_1()
                 .border_color(theme.border.opacity(0.65))
-                .label("发送")
+                .label(t!("chat.send").to_string())
         };
 
         div()

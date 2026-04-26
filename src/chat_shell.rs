@@ -51,6 +51,7 @@ pub(crate) struct ChatShell {
     messages_by_conversation: HashMap<String, Vec<ChatMessage>>,
     pub(crate) search_text: String,
     pub(crate) compose_text: String,
+    current_ui_language: config::UiLanguage,
     last_state_seq: u64,
     pending_scroll_to_bottom_frames: u8,
     stick_to_bottom: bool,
@@ -59,6 +60,15 @@ pub(crate) struct ChatShell {
 }
 
 impl ChatShell {
+    fn update_localized_placeholders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input.update(cx, |input, cx| {
+            input.set_placeholder(t!("chat.search_placeholder").to_string(), window, cx);
+        });
+        self.compose_input.update(cx, |input, cx| {
+            input.set_placeholder(String::new(), window, cx);
+        });
+    }
+
     fn clear_selected_unread_if_needed(&mut self) {
         if !self.stick_to_bottom {
             return;
@@ -84,7 +94,10 @@ impl ChatShell {
     }
 
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
+        let startup_config = config::load_config();
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("chat.search_placeholder").to_string())
+        });
         let compose_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("")
@@ -102,6 +115,7 @@ impl ChatShell {
             messages_by_conversation: HashMap::new(),
             search_text: String::new(),
             compose_text: String::new(),
+            current_ui_language: startup_config.ui_language,
             last_state_seq: 0,
             pending_scroll_to_bottom_frames: 0,
             stick_to_bottom: true,
@@ -142,7 +156,13 @@ impl ChatShell {
         let poll_task = cx.spawn_in(window, async move |entity, cx| loop {
             cx.background_executor().timer(Duration::from_millis(250)).await;
             let seq = app_state::state_seq();
-            let _ = entity.update_in(cx, |this, _, cx| {
+            let _ = entity.update_in(cx, |this, window, cx| {
+                let latest_config = config::load_config();
+                if this.current_ui_language != latest_config.ui_language {
+                    this.current_ui_language = latest_config.ui_language;
+                    this.update_localized_placeholders(window, cx);
+                    cx.notify();
+                }
                 if this.last_state_seq != seq {
                     this.last_state_seq = seq;
                     let should_scroll_bottom = this.refresh_from_state();
@@ -356,9 +376,9 @@ impl ChatShell {
                 message.text
             } else if let Some(file) = &file_data {
                 if file.is_dir {
-                    format!("[文件夹] {}", file.name.clone())
+                    t!("file.folder_prefix", name = file.name.clone()).to_string()
                 } else {
-                    format!("[文件] {}", file.name.clone())
+                    t!("file.file_prefix", name = file.name.clone()).to_string()
                 }
             } else {
                 String::new()

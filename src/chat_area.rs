@@ -17,7 +17,7 @@ impl ChatShell {
         let current_name = self
             .selected_conversation()
             .map(|c| c.name.clone())
-            .unwrap_or_else(|| "会话".to_string());
+            .unwrap_or_else(|| t!("app.conversation").to_string());
         let messages = self.messages_for_selected();
         let peer_avatar = current_name
             .chars()
@@ -56,39 +56,40 @@ impl ChatShell {
                     && (transfer.received > 0 || transfer.current_file.is_some());
                 let status = if message.from_me {
                     if transfer.canceled {
-                        "已取消".to_string()
+                        t!("transfer.canceled").to_string()
                     } else if transfer.error {
-                        "发送失败".to_string()
+                        t!("transfer.send_failed").to_string()
                     } else if transfer.saved {
-                        "已发送".to_string()
+                        t!("transfer.sent").to_string()
                     } else if transfer.sending {
-                        "发送中".to_string()
+                        t!("transfer.sending").to_string()
                     } else {
-                        "待对方接收".to_string()
+                        t!("transfer.waiting_peer").to_string()
                     }
                 } else if transfer.canceled {
-                    "已取消".to_string()
+                    t!("transfer.canceled").to_string()
                 } else if transfer.error {
-                    "下载失败".to_string()
+                    t!("transfer.download_failed").to_string()
                 } else if transfer.saved {
-                    "已保存".to_string()
+                    t!("transfer.saved").to_string()
                 } else if is_receiving {
                     if transfer.is_dir {
-                        "接收中".to_string()
+                        t!("transfer.receiving").to_string()
                     } else if transfer.size > 0 {
                         let percent =
                             ((transfer.received as f64 / transfer.size as f64) * 100.0).clamp(0.0, 100.0);
-                        format!(
-                            "接收中: {}/{} ({:.0}%)",
-                            transfer.received,
-                            transfer.size,
-                            percent
+                        t!(
+                            "transfer.receiving_progress",
+                            received = transfer.received,
+                            total = transfer.size,
+                            percent = format!("{:.0}", percent)
                         )
+                        .to_string()
                     } else {
-                        format!("接收中: {}", transfer.received)
+                        t!("transfer.receiving_bytes", received = transfer.received).to_string()
                     }
                 } else {
-                    "待接收".to_string()
+                    t!("transfer.waiting_receive").to_string()
                 };
 
                 let mut status_row = div()
@@ -114,7 +115,7 @@ impl ChatShell {
                         ))
                         .xsmall()
                         .ghost()
-                        .label("取消接收")
+                        .label(t!("chat.cancel_receive").to_string())
                         .on_click(cx.listener(move |this, _, _, _cx| {
                             this.cancel_transfer(transfer.clone(), false);
                         })),
@@ -128,7 +129,7 @@ impl ChatShell {
                         ))
                         .xsmall()
                         .ghost()
-                        .label("取消发送")
+                        .label(t!("chat.cancel_send").to_string())
                         .on_click(cx.listener(move |this, _, _, _cx| {
                             this.cancel_transfer(transfer.clone(), true);
                         })),
@@ -142,7 +143,7 @@ impl ChatShell {
                         ))
                         .xsmall()
                         .ghost()
-                        .label("在文件夹中打开")
+                        .label(t!("chat.open_in_folder").to_string())
                         .on_click(cx.listener(move |this, _, _, _cx| {
                             this.open_transfer_in_folder(transfer.clone());
                         })),
@@ -164,8 +165,10 @@ impl ChatShell {
                                         transfer
                                             .current_file
                                             .clone()
-                                            .map(|name| format!("正在接收文件: {}", name))
-                                            .unwrap_or_else(|| "正在接收文件夹内容...".to_string()),
+                                            .map(|name| {
+                                                t!("transfer.receiving_file", name = name).to_string()
+                                            })
+                                            .unwrap_or_else(|| t!("transfer.receiving_folder").to_string()),
                                     ),
                             );
                         } else {
@@ -205,7 +208,7 @@ impl ChatShell {
                                 Button::new(format!("recv-{}-{}", transfer.packet_no, transfer.file_id))
                                     .xsmall()
                                     .primary()
-                                    .label("接收")
+                                    .label(t!("chat.receive").to_string())
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.receive_attachment(transfer.clone(), window, cx);
                                     })),
@@ -228,7 +231,7 @@ impl ChatShell {
                     .bg(theme.primary)
                     .text_color(theme.primary_foreground)
                     .text_sm()
-                    .child("我")
+                    .child(t!("app.me").to_string())
             } else {
                 div()
                     .h_flex()

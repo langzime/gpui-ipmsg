@@ -149,7 +149,7 @@ impl ChatShell {
                         .py_2()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("No conversations"),
+                        .child(t!("chat.no_conversations").to_string()),
                 )
             })
             // .when(!self.search_text.trim().is_empty(), |this| {

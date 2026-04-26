@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate rust_i18n;
+
 use gpui::*;
 use gpui_component::Root;
 
@@ -12,7 +15,12 @@ mod logic;
 mod sidebar;
 pub(crate) use chat_shell::ChatShell;
 
+i18n!("locales", fallback = "zh-CN");
+
 fn main() {
+    let startup_config = config::load_config();
+    rust_i18n::set_locale(startup_config.ui_language.as_locale());
+
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
 
     app.run(|cx| {
