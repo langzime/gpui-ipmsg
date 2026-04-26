@@ -7,6 +7,7 @@ use gpui_component::{
     ActiveTheme, IconName, Root, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
+    scroll::ScrollableElement,
 };
 use std::sync::Mutex;
 
@@ -15,6 +16,7 @@ static SETTINGS_WINDOW_HANDLE: Mutex<Option<AnyWindowHandle>> = Mutex::new(None)
 struct SettingsWindowView {
     username_input: Entity<InputState>,
     group_input: Entity<InputState>,
+    settings_scroll_handle: ScrollHandle,
     username: String,
     group: String,
     language: LanguageEncoding,
@@ -42,6 +44,7 @@ impl SettingsWindowView {
         let mut this = Self {
             username_input,
             group_input,
+            settings_scroll_handle: ScrollHandle::default(),
             username,
             group,
             language,
@@ -119,6 +122,7 @@ impl Render for SettingsWindowView {
         div()
             .v_flex()
             .size_full()
+            .min_h_0()
             .bg(theme.background)
             .child(
                 TitleBar::new().child(
@@ -134,122 +138,137 @@ impl Render for SettingsWindowView {
                 div()
                     .v_flex()
                     .flex_1()
-                    .p_4()
-                    .gap_3()
-                    .child(div().text_sm().child(t!("settings.username").to_string()))
-                    .child(Input::new(&self.username_input))
-                    .child(div().text_sm().child(t!("settings.group").to_string()))
-                    .child(Input::new(&self.group_input))
-                    .child(div().text_sm().child(t!("settings.encoding").to_string()))
+                    .min_h_0()
+                    .overflow_hidden()
                     .child(
                         div()
-                            .h_flex()
-                            .gap_2()
+                            .id("settings-scroll")
+                            .v_flex()
+                            .size_full()
+                            .track_scroll(&self.settings_scroll_handle)
+                            .overflow_y_scroll()
+                            .vertical_scrollbar(&self.settings_scroll_handle)
                             .child(
-                                if self.language == LanguageEncoding::Utf8 {
-                                    Button::new("lang-utf8")
-                                        .small()
-                                        .primary()
-                                        .label("UTF-8")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_encoding(LanguageEncoding::Utf8, cx);
-                                        }))
-                                } else {
-                                    Button::new("lang-utf8")
-                                        .small()
-                                        .ghost()
-                                        .label("UTF-8")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_encoding(LanguageEncoding::Utf8, cx);
-                                        }))
-                                },
-                            )
-                            .child(
-                                if self.language == LanguageEncoding::Gb18030 {
-                                    Button::new("lang-gb18030")
-                                        .small()
-                                        .primary()
-                                        .label("GB18030")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_encoding(LanguageEncoding::Gb18030, cx);
-                                        }))
-                                } else {
-                                    Button::new("lang-gb18030")
-                                        .small()
-                                        .ghost()
-                                        .label("GB18030")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_encoding(LanguageEncoding::Gb18030, cx);
-                                        }))
-                                },
+                                div()
+                                    .v_flex()
+                                    .p_4()
+                                    .gap_3()
+                                    .child(div().text_sm().child(t!("settings.username").to_string()))
+                                    .child(Input::new(&self.username_input))
+                                    .child(div().text_sm().child(t!("settings.group").to_string()))
+                                    .child(Input::new(&self.group_input))
+                                    .child(div().text_sm().child(t!("settings.encoding").to_string()))
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .gap_2()
+                                            .child(
+                                                if self.language == LanguageEncoding::Utf8 {
+                                                    Button::new("lang-utf8")
+                                                        .small()
+                                                        .primary()
+                                                        .label("UTF-8")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_encoding(LanguageEncoding::Utf8, cx);
+                                                        }))
+                                                } else {
+                                                    Button::new("lang-utf8")
+                                                        .small()
+                                                        .ghost()
+                                                        .label("UTF-8")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_encoding(LanguageEncoding::Utf8, cx);
+                                                        }))
+                                                },
+                                            )
+                                            .child(
+                                                if self.language == LanguageEncoding::Gb18030 {
+                                                    Button::new("lang-gb18030")
+                                                        .small()
+                                                        .primary()
+                                                        .label("GB18030")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_encoding(LanguageEncoding::Gb18030, cx);
+                                                        }))
+                                                } else {
+                                                    Button::new("lang-gb18030")
+                                                        .small()
+                                                        .ghost()
+                                                        .label("GB18030")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_encoding(LanguageEncoding::Gb18030, cx);
+                                                        }))
+                                                },
+                                            ),
+                                    )
+                                    .child(div().text_sm().child(t!("settings.ui_language").to_string()))
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .gap_2()
+                                            .child(
+                                                if self.ui_language == UiLanguage::ZhCn {
+                                                    Button::new("ui-lang-zh-cn")
+                                                        .small()
+                                                        .primary()
+                                                        .label(t!("settings.ui_language_zh_cn").to_string())
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_ui_language(UiLanguage::ZhCn, cx);
+                                                        }))
+                                                } else {
+                                                    Button::new("ui-lang-zh-cn")
+                                                        .small()
+                                                        .ghost()
+                                                        .label(t!("settings.ui_language_zh_cn").to_string())
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_ui_language(UiLanguage::ZhCn, cx);
+                                                        }))
+                                                },
+                                            )
+                                            .child(
+                                                if self.ui_language == UiLanguage::En {
+                                                    Button::new("ui-lang-en")
+                                                        .small()
+                                                        .primary()
+                                                        .label(t!("settings.ui_language_en").to_string())
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_ui_language(UiLanguage::En, cx);
+                                                        }))
+                                                } else {
+                                                    Button::new("ui-lang-en")
+                                                        .small()
+                                                        .ghost()
+                                                        .label(t!("settings.ui_language_en").to_string())
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.set_ui_language(UiLanguage::En, cx);
+                                                        }))
+                                                },
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .justify_end()
+                                            .child(
+                                                Button::new("save-settings")
+                                                    .small()
+                                                    .primary()
+                                                    .label(t!("settings.save").to_string())
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.save(cx);
+                                                    })),
+                                            ),
+                                    )
+                                    .when(!self.status_text.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(self.status_text.clone()),
+                                        )
+                                    }),
                             ),
-                    )
-                    .child(div().text_sm().child(t!("settings.ui_language").to_string()))
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_2()
-                            .child(
-                                if self.ui_language == UiLanguage::ZhCn {
-                                    Button::new("ui-lang-zh-cn")
-                                        .small()
-                                        .primary()
-                                        .label(t!("settings.ui_language_zh_cn").to_string())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_ui_language(UiLanguage::ZhCn, cx);
-                                        }))
-                                } else {
-                                    Button::new("ui-lang-zh-cn")
-                                        .small()
-                                        .ghost()
-                                        .label(t!("settings.ui_language_zh_cn").to_string())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_ui_language(UiLanguage::ZhCn, cx);
-                                        }))
-                                },
-                            )
-                            .child(
-                                if self.ui_language == UiLanguage::En {
-                                    Button::new("ui-lang-en")
-                                        .small()
-                                        .primary()
-                                        .label(t!("settings.ui_language_en").to_string())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_ui_language(UiLanguage::En, cx);
-                                        }))
-                                } else {
-                                    Button::new("ui-lang-en")
-                                        .small()
-                                        .ghost()
-                                        .label(t!("settings.ui_language_en").to_string())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_ui_language(UiLanguage::En, cx);
-                                        }))
-                                },
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .justify_end()
-                            .child(
-                                Button::new("save-settings")
-                                    .small()
-                                    .primary()
-                                    .label(t!("settings.save").to_string())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save(cx);
-                                    })),
-                            ),
-                    )
-                    .when(!self.status_text.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(self.status_text.clone()),
-                        )
-                    }),
+                    ),
             )
     }
 }
@@ -310,7 +329,7 @@ impl ChatShell {
                             *SETTINGS_WINDOW_HANDLE.lock().unwrap() = None;
                         }
                         let main_size = window.viewport_size();
-                        let settings_size = size(main_size.width / 2., main_size.height / 2.);
+                        let settings_size = size(main_size.width / 2., main_size.height * 0.70);
                         let mut options = WindowOptions::default();
                         options.window_bounds = Some(WindowBounds::centered(settings_size, cx));
                         options.titlebar = Some(TitlebarOptions {
