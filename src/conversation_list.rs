@@ -152,16 +152,16 @@ impl ChatShell {
                         .child("No conversations"),
                 )
             })
-            .when(!self.search_text.trim().is_empty(), |this| {
-                this.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("filter: {}", self.search_text)),
-                )
-            })
+            // .when(!self.search_text.trim().is_empty(), |this| {
+            //     this.child(
+            //         div()
+            //             .px_3()
+            //             .py_1()
+            //             .text_xs()
+            //             .text_color(theme.muted_foreground)
+            //             .child(format!("结果: {}", self.search_text)),
+            //     )
+            // })
             .child(list)
     }
 }

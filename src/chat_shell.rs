@@ -84,7 +84,7 @@ impl ChatShell {
     }
 
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let compose_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("")
