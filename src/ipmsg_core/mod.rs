@@ -275,6 +275,7 @@ struct FileEntry {
 static FILE_TABLE: Lazy<Mutex<HashMap<(u32, u32), FileEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static FILE_ID_SEQ: AtomicU32 = AtomicU32::new(1);
+static PACKET_NO_SEQ: AtomicU32 = AtomicU32::new(1);
 static SEND_CANCEL_FLAGS: Lazy<Mutex<HashMap<(SocketAddr, u32, u32), Arc<AtomicBool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -550,11 +551,22 @@ impl Service {
 }
 
 fn now_millis() -> u32 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    (millis & 0xffff_ffff) as u32
+    const MAX_PACKET_NO: u32 = 0x7fff_ffff;
+    loop {
+        let current = PACKET_NO_SEQ.load(Ordering::Relaxed);
+        let current = if current == 0 || current > MAX_PACKET_NO {
+            1
+        } else {
+            current
+        };
+        let next = if current >= MAX_PACKET_NO { 1 } else { current + 1 };
+        if PACKET_NO_SEQ
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return current;
+        }
+    }
 }
 
 async fn send_ansentry(socket: &UdpSocket, to: SocketAddr) -> Result<()> {
