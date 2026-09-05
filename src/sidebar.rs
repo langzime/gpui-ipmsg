@@ -1,4 +1,5 @@
 use super::ChatShell;
+use crate::app_state;
 use crate::config::{LanguageEncoding, UiLanguage};
 use crate::logic;
 use gpui::*;
@@ -9,9 +10,11 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement,
 };
-use std::sync::Mutex;
 
-static SETTINGS_WINDOW_HANDLE: Mutex<Option<AnyWindowHandle>> = Mutex::new(None);
+/// Settings 窗口句柄：以 GPUI Global 收拢，替代原先的静态 `Mutex`（中期项 1）。
+#[derive(Default)]
+struct SettingsWindowHandle(Option<AnyWindowHandle>);
+impl Global for SettingsWindowHandle {}
 
 struct SettingsWindowView {
     username_input: Entity<InputState>,
@@ -88,7 +91,13 @@ impl SettingsWindowView {
             cx.notify();
             return;
         }
-        match logic::save_settings(username, group, self.language, self.ui_language) {
+        match logic::save_settings(
+            username,
+            group,
+            self.language,
+            self.ui_language,
+            cx.global::<app_state::AppStateGlobal>().arc(),
+        ) {
             Ok(()) => self.status_text = t!("status.saved_and_broadcasted").to_string(),
             Err(error) => {
                 self.status_text = t!("status.save_failed", error = error).to_string();
@@ -106,12 +115,6 @@ impl SettingsWindowView {
         self.ui_language = ui_language;
         rust_i18n::set_locale(ui_language.as_locale());
         cx.notify();
-    }
-}
-
-impl Drop for SettingsWindowView {
-    fn drop(&mut self) {
-        *SETTINGS_WINDOW_HANDLE.lock().unwrap() = None;
     }
 }
 
@@ -315,7 +318,7 @@ impl ChatShell {
                     .ghost()
                     .icon(IconName::Settings)
                     .on_click(move |_, window, cx| {
-                        let existing = SETTINGS_WINDOW_HANDLE.lock().unwrap().as_ref().copied();
+                        let existing = cx.global_mut::<SettingsWindowHandle>().0;
                         if let Some(handle) = existing {
                             if handle
                                 .update(cx, |_, window, _| {
@@ -326,30 +329,33 @@ impl ChatShell {
                                 cx.stop_propagation();
                                 return;
                             }
-                            *SETTINGS_WINDOW_HANDLE.lock().unwrap() = None;
+                            // 窗口已销毁，清掉陈旧句柄后重新打开。
+                            cx.global_mut::<SettingsWindowHandle>().0 = None;
                         }
                         let main_size = window.viewport_size();
                         let settings_size = size(main_size.width / 2., main_size.height * 0.70);
-                        let mut options = WindowOptions::default();
-                        options.window_bounds = Some(WindowBounds::centered(settings_size, cx));
-                        options.titlebar = Some(TitlebarOptions {
-                            title: None,
-                            appears_transparent: true,
-                            traffic_light_position: None,
-                        });
+                        let options = WindowOptions {
+                            window_bounds: Some(WindowBounds::centered(settings_size, cx)),
+                            titlebar: Some(TitlebarOptions {
+                                title: None,
+                                appears_transparent: true,
+                                traffic_light_position: None,
+                            }),
+                            ..Default::default()
+                        };
 
                         match cx.open_window(options, |window, cx| {
                             let view = cx.new(|cx| SettingsWindowView::new(window, cx));
                             cx.new(|cx| Root::new(view, window, cx))
                         }) {
                             Ok(handle) => {
-                                *SETTINGS_WINDOW_HANDLE.lock().unwrap() = Some(handle.into());
+                                cx.global_mut::<SettingsWindowHandle>().0 = Some(handle.into());
                                 let _ = handle.update(cx, |_, window, _| {
                                     window.activate_window();
                                 });
                             }
                             Err(_) => {
-                                *SETTINGS_WINDOW_HANDLE.lock().unwrap() = None;
+                                cx.global_mut::<SettingsWindowHandle>().0 = None;
                             }
                         }
                         cx.stop_propagation();

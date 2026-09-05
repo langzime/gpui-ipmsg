@@ -1,4 +1,5 @@
-use crate::{app_state, logic};
+use crate::app_state::{self, AppState};
+use crate::{logic};
 use gpui::*;
 use gpui_component::{
     ActiveTheme, Root, StyledExt, TitleBar,
@@ -7,6 +8,7 @@ use gpui_component::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct Conversation {
@@ -17,40 +19,14 @@ pub(crate) struct Conversation {
     pub(crate) unread: u32,
 }
 
-#[derive(Clone)]
-pub(crate) struct ChatMessage {
-    pub(crate) id: u64,
-    pub(crate) to: SocketAddr,
-    pub(crate) from_me: bool,
-    pub(crate) text: String,
-    pub(crate) file: Option<FileTransfer>,
-    pub(crate) failed: bool,
-    pub(crate) delivered: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct FileTransfer {
-    pub(crate) from: SocketAddr,
-    pub(crate) packet_no: u32,
-    pub(crate) file_id: u32,
-    pub(crate) name: String,
-    pub(crate) size: u64,
-    pub(crate) is_dir: bool,
-    pub(crate) saved: bool,
-    pub(crate) received: u64,
-    pub(crate) current_file: Option<String>,
-    pub(crate) local_path: Option<String>,
-    pub(crate) error: bool,
-    pub(crate) canceled: bool,
-    pub(crate) sending: bool,
-}
-
 /// UI 侧共享状态的 Entity：由状态 actor 的 `StateDelta` 推送驱动更新，
 /// 并通过 `EventEmitter<UiEvent>` 通知订阅者。ChatShell 由此只保留选择、
 /// 滚动、输入草稿等本地态（docs/architecture.md §4.2：事件推送替代轮询）。
+/// 消息直接使用 `app_state::ChatMessage` 领域模型，仅做投影（会话列表项、
+/// 展示文本），不再维护第三套消息表示（中期项 2）。
 pub(crate) struct UiState {
     conversations: Vec<Conversation>,
-    messages_by_conversation: HashMap<String, Vec<ChatMessage>>,
+    messages_by_conversation: HashMap<String, Vec<app_state::ChatMessage>>,
     unread: HashMap<SocketAddr, u32>,
     users: Vec<app_state::OnlineUser>,
 }
@@ -66,6 +42,30 @@ pub(crate) enum UiEvent {
 }
 
 impl EventEmitter<UiEvent> for UiState {}
+
+/// 会话归属：以对端地址为稳定 id。
+fn peer_addr(message: &app_state::ChatMessage) -> SocketAddr {
+    if message.is_me {
+        message.to
+    } else {
+        message.from
+    }
+}
+
+/// 展示文本投影：领域消息不携带本地化气泡文案时，依据附件类型生成。
+pub(crate) fn display_text(message: &app_state::ChatMessage) -> String {
+    if !message.text.is_empty() {
+        message.text.clone()
+    } else if let Some(file) = &message.file {
+        if file.is_dir {
+            t!("file.folder_prefix", name = file.name.clone()).to_string()
+        } else {
+            t!("file.file_prefix", name = file.name.clone()).to_string()
+        }
+    } else {
+        String::new()
+    }
+}
 
 impl UiState {
     /// 由 users + messages + unread 重建会话列表（按名称排序、取每会话
@@ -91,7 +91,7 @@ impl UiState {
             );
         }
         for (id, msgs) in &self.messages_by_conversation {
-            let subtitle = msgs.last().map(|m| m.text.clone()).unwrap_or_default();
+            let subtitle = msgs.last().map(display_text).unwrap_or_default();
             convs.entry(id.clone())
                 .or_insert_with(|| Conversation {
                     id: id.clone(),
@@ -115,10 +115,12 @@ impl UiState {
     fn apply(&mut self, delta: app_state::StateDelta, cx: &mut Context<Self>) {
         match delta {
             app_state::StateDelta::Sync { messages } => {
-                let mut grouped = HashMap::<String, Vec<ChatMessage>>::new();
+                let mut grouped = HashMap::<String, Vec<app_state::ChatMessage>>::new();
                 for message in &messages {
-                    let view = to_view_message(message);
-                    grouped.entry(view.to.to_string()).or_default().push(view);
+                    grouped
+                        .entry(peer_addr(message).to_string())
+                        .or_default()
+                        .push(message.clone());
                 }
                 self.messages_by_conversation = grouped;
                 self.rebuild_conversations();
@@ -130,22 +132,20 @@ impl UiState {
                 cx.emit(UiEvent::Changed);
             }
             app_state::StateDelta::MessageAdded { message } => {
-                let view = to_view_message(&message);
-                let conv_id = view.to.to_string();
+                let conv_id = peer_addr(&message).to_string();
                 self.messages_by_conversation
                     .entry(conv_id.clone())
                     .or_default()
-                    .push(view);
+                    .push(message);
                 self.rebuild_conversations();
                 cx.emit(UiEvent::MessageAdded { conv_id });
             }
             app_state::StateDelta::MessageUpdated { message } => {
-                let view = to_view_message(&message);
-                let conv_id = view.to.to_string();
+                let conv_id = peer_addr(&message).to_string();
                 if let Some(list) = self.messages_by_conversation.get_mut(&conv_id)
-                    && let Some(pos) = list.iter().position(|m| m.id == view.id)
+                    && let Some(pos) = list.iter().position(|m| m.id == message.id)
                 {
-                    list[pos] = view;
+                    list[pos] = message;
                 }
                 cx.emit(UiEvent::Changed);
             }
@@ -171,53 +171,11 @@ impl UiState {
         self.conversations.iter().find(|c| c.id == id)
     }
 
-    pub(crate) fn messages_for(&self, conv_id: &str) -> &[ChatMessage] {
+    pub(crate) fn messages_for(&self, conv_id: &str) -> &[app_state::ChatMessage] {
         self.messages_by_conversation
             .get(conv_id)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
-    }
-}
-
-fn to_view_message(message: &app_state::ChatMessage) -> ChatMessage {
-    let peer = if message.is_me {
-        message.to
-    } else {
-        message.from
-    };
-    let text = if !message.text.is_empty() {
-        message.text.clone()
-    } else if let Some(file) = &message.file {
-        if file.is_dir {
-            t!("file.folder_prefix", name = file.name.clone()).to_string()
-        } else {
-            t!("file.file_prefix", name = file.name.clone()).to_string()
-        }
-    } else {
-        String::new()
-    };
-    ChatMessage {
-        id: message.id,
-        to: peer,
-        from_me: message.is_me,
-        text,
-        file: message.file.as_ref().map(|f| FileTransfer {
-            from: peer,
-            packet_no: f.packet_no,
-            file_id: f.file_id,
-            name: f.name.clone(),
-            size: f.size,
-            is_dir: f.is_dir,
-            saved: f.saved,
-            received: f.received,
-            current_file: f.current_file.clone(),
-            local_path: f.local_path.clone(),
-            error: f.error,
-            canceled: f.canceled,
-            sending: f.sending,
-        }),
-        failed: message.failed,
-        delivered: message.delivered,
     }
 }
 
@@ -230,6 +188,7 @@ pub(crate) struct ChatShell {
     pub(crate) selected_id: Option<String>,
     pub(crate) search_text: String,
     pub(crate) compose_text: String,
+    pub(crate) app_state: Arc<AppState>,
     pending_scroll_to_bottom_frames: u8,
     stick_to_bottom: bool,
     _subscriptions: Vec<Subscription>,
@@ -262,7 +221,8 @@ impl ChatShell {
                 .unwrap_or(false)
         });
         if cleared && let Ok(addr) = selected_id.parse::<SocketAddr>() {
-            app_state::dispatch_cmd(app_state::StateCmd::ClearUnread { addr });
+            self.app_state
+                .dispatch(app_state::StateCmd::ClearUnread { addr });
         }
     }
 
@@ -285,6 +245,10 @@ impl ChatShell {
         });
 
         logic::ensure_started();
+        // 状态实例在 `ensure_started` 中同步创建；注入 GPUI Global 供设置窗口等
+        // 任意主线程代码读取，UI 侧不再触碰任何全局静态（中期项 1）。
+        let app_state = app_state::app_state().clone();
+        cx.set_global(app_state::AppStateGlobal(app_state.clone()));
 
         let ui_state = cx.new(|_| UiState {
             conversations: Vec::new(),
@@ -301,6 +265,7 @@ impl ChatShell {
             selected_id: None,
             search_text: String::new(),
             compose_text: String::new(),
+            app_state,
             pending_scroll_to_bottom_frames: 0,
             stick_to_bottom: true,
             _subscriptions: Vec::new(),
@@ -358,7 +323,7 @@ impl ChatShell {
 
         // 状态 actor → UiState 桥接：actor 推 StateDelta，本任务在主线程
         // 应用到 UiState Entity 并经 EventEmitter 通知。替代原先的 250ms 轮询。
-        if let Some(mut delta_rx) = app_state::take_delta_rx() {
+        if let Some(mut delta_rx) = this.app_state.take_delta_rx() {
             let ui_state = this.ui_state.clone();
             let bridge = cx.spawn_in(window, async move |_, cx| {
                 while let Some(delta) = delta_rx.recv().await {
@@ -379,7 +344,8 @@ impl ChatShell {
             }
         });
         if let Ok(addr) = conv_id.parse::<SocketAddr>() {
-            app_state::dispatch_cmd(app_state::StateCmd::ClearUnread { addr });
+            self.app_state
+                .dispatch(app_state::StateCmd::ClearUnread { addr });
         }
         self.message_scroll_handle.scroll_to_bottom();
         cx.notify();
@@ -395,7 +361,7 @@ impl ChatShell {
             return;
         };
         if let Ok(to) = conv_id.parse::<SocketAddr>() {
-            logic::send_text(to, text);
+            logic::send_text(to, text, &self.app_state);
         }
         self.compose_text.clear();
         self.compose_input.update(cx, |input, cx| {
@@ -411,6 +377,7 @@ impl ChatShell {
         let Ok(to) = conv_id.parse::<SocketAddr>() else {
             return;
         };
+        let app_state = self.app_state.clone();
         cx.spawn_in(window, async move |_, _| {
             let Some(paths) = rfd::AsyncFileDialog::new().pick_files().await else {
                 return;
@@ -420,7 +387,7 @@ impl ChatShell {
                 .map(|p| p.path().to_string_lossy().to_string())
                 .collect::<Vec<_>>();
             if !selected.is_empty() {
-                logic::send_files(to, selected);
+                logic::send_files(to, selected, &app_state);
             }
         })
         .detach();
@@ -433,24 +400,27 @@ impl ChatShell {
         let Ok(to) = conv_id.parse::<SocketAddr>() else {
             return;
         };
+        let app_state = self.app_state.clone();
         cx.spawn_in(window, async move |_, _| {
             let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await else {
                 return;
             };
-            logic::send_folder(to, folder.path().to_string_lossy().to_string());
+            logic::send_folder(to, folder.path().to_string_lossy().to_string(), &app_state);
         })
         .detach();
     }
 
     pub(crate) fn receive_attachment(
         &mut self,
-        transfer: FileTransfer,
+        peer: SocketAddr,
+        transfer: app_state::FileInfo,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if transfer.saved {
             return;
         }
+        let app_state = self.app_state.clone();
         cx.spawn_in(window, async move |_, _| {
             if transfer.is_dir {
                 let Some(parent) = rfd::AsyncFileDialog::new().pick_folder().await else {
@@ -461,7 +431,7 @@ impl ChatShell {
                     .join(&transfer.name)
                     .to_string_lossy()
                     .to_string();
-                logic::download_folder(transfer.from, transfer.packet_no, transfer.file_id, save_path);
+                logic::download_folder(peer, transfer.packet_no, transfer.file_id, save_path, &app_state);
             } else {
                 let Some(path) = rfd::AsyncFileDialog::new()
                     .set_file_name(&transfer.name)
@@ -471,32 +441,38 @@ impl ChatShell {
                     return;
                 };
                 logic::download_file(
-                    transfer.from,
+                    peer,
                     transfer.packet_no,
                     transfer.file_id,
                     transfer.size,
                     path.path().to_string_lossy().to_string(),
+                    &app_state,
                 );
             }
         })
         .detach();
     }
 
-    pub(crate) fn open_transfer_in_folder(&mut self, transfer: FileTransfer) {
+    pub(crate) fn open_transfer_in_folder(&mut self, transfer: app_state::FileInfo) {
         if let Some(path) = transfer.local_path {
             logic::open_in_folder(path, transfer.is_dir);
         }
     }
 
-    pub(crate) fn cancel_transfer(&mut self, transfer: FileTransfer, from_me: bool) {
+    pub(crate) fn cancel_transfer(
+        &mut self,
+        peer: SocketAddr,
+        transfer: app_state::FileInfo,
+        from_me: bool,
+    ) {
         if from_me {
-            logic::cancel_upload(transfer.from, transfer.packet_no, transfer.file_id);
+            logic::cancel_upload(peer, transfer.packet_no, transfer.file_id, &self.app_state);
         } else {
-            logic::cancel_download(transfer.from, transfer.packet_no, transfer.file_id);
+            logic::cancel_download(peer, transfer.packet_no, transfer.file_id, &self.app_state);
         }
     }
 
-    pub(crate) fn retry_message(&mut self, message: ChatMessage) {
+    pub(crate) fn retry_message(&mut self, message: app_state::ChatMessage) {
         if !message.failed {
             return;
         }
@@ -504,7 +480,13 @@ impl ChatShell {
             .file
             .as_ref()
             .and_then(|f| f.local_path.clone().map(|p| (p, f.is_dir)));
-        logic::retry_message(message.id, message.to, message.text, file);
+        logic::retry_message(
+            message.id,
+            peer_addr(&message),
+            display_text(&message),
+            file,
+            &self.app_state,
+        );
     }
 }
 

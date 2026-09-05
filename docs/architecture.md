@@ -363,3 +363,30 @@ crates/
 | UiState Entity（EventEmitter）+ 桥接任务 + 按 id 选择 | [chat_shell.rs](../src/chat_shell.rs) |
 | 会话列表/聊天区改读 UiState | [conversation_list.rs](../src/conversation_list.rs) / [chat_area.rs](../src/chat_area.rs) |
 | SettingsSaved 通知链 | [logic.rs](../src/logic.rs) |
+
+### 2026-09-05 中期项 1+2：全局静态收拢 + 消息单一领域模型（已完成，`cargo check`/`clippy`/`test` 通过）
+
+落实 §4.2 中期第 1、2 项。
+
+**全局静态收拢为实例（中期项 1）**
+- `ipmsg_core`：新增 `Service` 结构体，收拢原 `MAIN_SOCKET`/`NET_CONFIG`/`USER_INFO`/`TEXT_ENCODING`/`FILE_TABLE`/`FILE_ID_SEQ`/`PACKET_NO_SEQ`/`SEND_CANCEL_FLAGS`/`EXT_ID_PART` 等全局态；原先读写这些全局的自由函数（`send_message`/`send_files`/`recv_file`/`handle_udp_packet`/`addr_allowed`/`broadcast_target` 等约 20 个）改为 `Service` 方法，经 `&self` 访问状态。`OnceLock<Arc<Service>>` 单例由 `start_ipmsg()` 写入，`service()`/`try_service()` 供 tokio 任务取用（后者在未启动/启动失败时返回 None，供退出流程安全跳过）。UDP/TCP 常驻任务各自持有 `Arc<Service>` 克隆。
+- `app_state`：`STATE_SNAPSHOT`/`STATE_CMD_TX`/`STATE_DELTA`/`NEXT_MESSAGE_ID` 收进 `AppState` 实例（命令/增量通道、快照、消息 id 序列、`active_downloads` 下载任务表），`init_state()` 改为 `AppState::init()` 方法。UI 侧经 GPUI Global 注入：`AppStateGlobal(pub Arc<AppState>)` newtype（`Arc` 是外部类型，按孤儿规则不能直接实现 `Global`，套 newtype 是 GPUI Global 文档推荐做法），`ChatShell::new` 中 `cx.set_global`，设置窗口等主线程代码经 `cx.global::<AppStateGlobal>()` 读取——UI 层不再触碰任何全局静态。
+- `logic`：发送/下载/设置函数全部改为接收 `&Arc<AppState>`；`ACTIVE_DOWNLOADS` 静态并入 `AppState.active_downloads`；`ensure_started` 在 runtime 线程之外同步创建 `AppState` 并 `set_instance`，协议服务 `start_ipmsg` 由事件泵任务（`AppState::pump_events`）在 runtime 内启动——消除"UI 先 dispatch 而全局未初始化即 panic"的隐式初始化顺序问题。
+- `sidebar`：`SETTINGS_WINDOW_HANDLE` 静态改为 `SettingsWindowHandle` GPUI Global。
+
+**消息三表示合并为单一领域模型（中期项 2）**
+- 删除 `chat_shell::ChatMessage`/`FileTransfer` 第二、三套表示；`UiState` 直接存储 `app_state::ChatMessage`/`FileInfo` 领域模型。
+- UI 渲染只做投影：新增 `display_text` helper 依据附件类型生成气泡文案（文件夹/文件前缀），替代此前状态层、视图层、逻辑层多处重复拼接；`chat_area`/`conversation_list` 同步改读领域模型。
+
+**剩余全局态**：仅 4 处且全部"写一次读多次"——初始化守卫 `RUNTIME_HANDLE`/`STARTED`（OnceCell）与单例注册器 `APP_STATE`/`SERVICE`（OnceLock）；原 13 个运行时可变全局已全部消除。
+
+| 变更 | 位置 |
+|---|---|
+| Service 结构体 + ~20 函数方法化 + 单例 | [ipmsg_core/mod.rs](../src/ipmsg_core/mod.rs) |
+| AppState 实例 + AppStateGlobal + 方法化 | [app_state.rs](../src/app_state.rs) |
+| `&Arc<AppState>` 参数 + ensure_started 同步建实例 + 下载表迁移 | [logic.rs](../src/logic.rs) |
+| 删除两套消息表示 + display_text 投影 | [chat_shell.rs](../src/chat_shell.rs) |
+| 渲染切片改读领域模型 | [chat_area.rs](../src/chat_area.rs) / [conversation_list.rs](../src/conversation_list.rs) |
+| SettingsWindowHandle GPUI Global | [sidebar.rs](../src/sidebar.rs) |
+
+**当前进度**：P0 全部 + P1 五项（送达状态机、失败可见化/重试、事件推送替代轮询、全局态收拢、消息单一模型）已完成；剩余 P1：历史 JSONL 化、`UpdateProgress` 类型化、i18n 出状态/协议层、`UN:` 稳定身份、render 副作用清理。

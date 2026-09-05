@@ -28,13 +28,15 @@ fn main() {
     app.run(|cx| {
         gpui_component::init(cx);
 
-        let mut options = WindowOptions::default();
-        options.window_bounds = Some(WindowBounds::centered(size(px(800.), px(600.)), cx));
-        options.titlebar = Some(TitlebarOptions {
-            title: None,
-            appears_transparent: true,
-            traffic_light_position: None,
-        });
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(800.), px(600.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            ..Default::default()
+        };
 
         cx.open_window(options, |window, cx| {
             let view = cx.new(|cx| ChatShell::new(window, cx));

@@ -5,12 +5,11 @@ use anyhow::{anyhow, Result};
 use encoding_rs::{Encoding, GB18030, UTF_8};
 use get_if_addrs::get_if_addrs;
 use log::{info, warn};
-use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -33,36 +32,25 @@ pub enum TextEncoding {
     Gb18030,
 }
 
-static TEXT_ENCODING: Lazy<RwLock<TextEncoding>> = Lazy::new(|| RwLock::new(TextEncoding::Gb18030));
-
-fn current_text_encoding() -> TextEncoding {
-    *TEXT_ENCODING.read().unwrap()
-}
-
-fn current_codec() -> &'static Encoding {
-    match current_text_encoding() {
+fn codec_for(enc: TextEncoding) -> &'static Encoding {
+    match enc {
         TextEncoding::Utf8 => UTF_8,
         TextEncoding::Gb18030 => GB18030,
     }
 }
 
-fn encode_text(s: &str) -> Vec<u8> {
-    let (buf, _, _) = current_codec().encode(s);
+fn encode_text(enc: TextEncoding, s: &str) -> Vec<u8> {
+    let (buf, _, _) = codec_for(enc).encode(s);
     buf.into_owned()
 }
 
-fn decode_text(buf: &[u8]) -> String {
-    let (s, _, _) = current_codec().decode(buf);
+fn decode_text(enc: TextEncoding, buf: &[u8]) -> String {
+    let (s, _, _) = codec_for(enc).decode(buf);
     s.into_owned()
 }
 
-pub fn set_text_encoding(encoding: TextEncoding) {
-    let mut current = TEXT_ENCODING.write().unwrap();
-    *current = encoding;
-}
-
 impl Packet {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, enc: TextEncoding) -> Vec<u8> {
         let s = format!(
             "{}:{}:{}:{}:{}:{}",
             self.version,
@@ -73,12 +61,12 @@ impl Packet {
             self.extra
         );
         info!("encode: {:?} ", s);
-        encode_text(&s)
+        encode_text(enc, &s)
     }
 }
 
-pub fn parse_packet(buf: &[u8]) -> Result<Packet> {
-    let s = decode_text(buf);
+pub fn parse_packet(buf: &[u8], enc: TextEncoding) -> Result<Packet> {
+    let s = decode_text(enc, buf);
     info!("parse: {:?} ", s);
     let parts = s.splitn(6, ':').collect::<Vec<_>>();
     if parts.len() < 5 {
@@ -239,63 +227,10 @@ pub struct SentFileMeta {
     pub is_dir: bool,
 }
 
-pub struct Service {
-    pub socket: Arc<UdpSocket>,
-    pub events: broadcast::Sender<Event>,
-    pub port: u16,
-}
-
-static NET_CONFIG: Lazy<Option<(String, Ipv4Addr)>> = Lazy::new(detect_net);
-static MAIN_SOCKET: Lazy<Mutex<Option<Arc<UdpSocket>>>> = Lazy::new(|| Mutex::new(None));
-
 pub struct UserInfo {
     pub username: String,
     pub hostname: String,
     pub group: String,
-}
-
-static USER_INFO: Lazy<RwLock<UserInfo>> = Lazy::new(|| {
-    let username = whoami::username();
-    let hostname = hostname::get().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|_| "host".into());
-    RwLock::new(UserInfo {
-        username,
-        hostname,
-        group: "".to_string(),
-    })
-});
-
-pub fn set_user_info(name: &str, group: &str) {
-    let mut info = USER_INFO.write().unwrap();
-    info.username = name.to_string();
-    info.group = group.to_string();
-}
-
-static EXT_ID_PART: Lazy<String> = Lazy::new(|| {
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    format!("{:016x}", t as u64)
-});
-
-fn build_user_extra() -> String {
-    let info = USER_INFO.read().unwrap();
-    let mut extra = String::new();
-    extra.push_str(&info.username);
-    extra.push('\0');
-    extra.push_str(&info.group);
-    extra.push('\0');
-    extra.push_str("UN:");
-    extra.push_str(&format!("{}-<{}>", info.username, *EXT_ID_PART));
-    extra.push('\0');
-    extra.push_str("HN:");
-    extra.push_str(&info.hostname);
-    extra.push('\0');
-    extra.push_str("NN:");
-    extra.push_str(&info.username);
-    extra.push('\0');
-    extra.push_str("GN:");
-    extra.push_str(&info.group);
-    extra.push('\0');
-    extra.push_str("VS:00010002:5:7:2");
-    extra
 }
 
 #[derive(Clone, Debug)]
@@ -308,15 +243,48 @@ struct FileEntry {
     is_dir: bool,
 }
 
-static FILE_TABLE: Lazy<Mutex<HashMap<(u32, u32), FileEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static PACKET_NO_SEQ: AtomicU32 = AtomicU32::new(1);
-
 /// Identifies an in-flight outgoing transfer: destination host (IP only — the
 /// TCP peer connects from an ephemeral port), plus the offered packet/file ids.
 type CancelKey = (IpAddr, u32, u32);
-static SEND_CANCEL_FLAGS: Lazy<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 协议层唯一实例：持有 UDP/TCP socket、事件通道以及原本散落的全局可变态
+/// （编码、本机信息、文件表、取消令牌、包号序列、网卡探测结果）。
+/// 通过 `start_ipmsg()` 创建并注册到 `service()`；所有消费者均为 tokio 任务，
+/// 因此经线程安全的 `Arc` 共享而非 GPUI `cx`（cx 只在主线程可达）。
+pub struct Service {
+    pub socket: Arc<UdpSocket>,
+    pub events: broadcast::Sender<Event>,
+    pub port: u16,
+    text_encoding: RwLock<TextEncoding>,
+    user_info: RwLock<UserInfo>,
+    net_config: Option<(String, Ipv4Addr)>,
+    ext_id_part: String,
+    file_table: Mutex<HashMap<(u32, u32), FileEntry>>,
+    packet_no_seq: AtomicU32,
+    cancel_flags: Mutex<HashMap<CancelKey, Arc<AtomicBool>>>,
+}
+
+static SERVICE: OnceLock<Arc<Service>> = OnceLock::new();
+
+/// The started protocol service. Panics if `start_ipmsg` has not completed.
+pub fn service() -> &'static Arc<Service> {
+    SERVICE.get().expect("ipmsg service not started")
+}
+
+/// Non-panicking variant, used by shutdown paths that must stay graceful even
+/// when the service never started (e.g. `start_ipmsg` failed).
+pub fn try_service() -> Option<&'static Arc<Service>> {
+    SERVICE.get()
+}
+
+/// 创建并注册协议服务（仅绑定 socket 与通道，不广播不监听）。
+/// 调用方随后设置编码/本机信息并调用 `spawn()` 开始收发。
+pub async fn start_ipmsg() -> Result<Arc<Service>> {
+    env_logger::try_init().ok();
+    let service = Arc::new(Service::new().await?);
+    let _ = SERVICE.set(Arc::clone(&service));
+    Ok(service)
+}
 
 /// Random, unguessable file transfer id (sequential ids were trivially
 /// enumerable by any LAN host).
@@ -329,47 +297,107 @@ fn random_file_id() -> u32 {
     rand::random::<u32>() & 0x7fff_ffff
 }
 
-fn send_cancel_token(peer: IpAddr, packet_no: u32, file_id: u32) -> Arc<AtomicBool> {
-    let mut flags = SEND_CANCEL_FLAGS.lock().unwrap();
-    flags
-        .entry((peer, packet_no, file_id))
-        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-        .clone()
-}
-
-fn clear_send_cancel_token(peer: IpAddr, packet_no: u32, file_id: u32) {
-    SEND_CANCEL_FLAGS
-        .lock()
-        .unwrap()
-        .remove(&(peer, packet_no, file_id));
-}
-
-pub fn cancel_send(to: SocketAddr, packet_no: u32, file_id: u32) -> bool {
-    let removed = FILE_TABLE.lock().unwrap().remove(&(packet_no, file_id)).is_some();
-    let token = send_cancel_token(to.ip(), packet_no, file_id);
-    token.store(true, Ordering::SeqCst);
-    removed
-}
-
 impl Service {
     pub async fn new() -> Result<Self> {
         let port = PORT;
         let raw = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)).await?;
         raw.set_broadcast(true)?;
         let socket = Arc::new(raw);
-        {
-            let mut g = MAIN_SOCKET.lock().unwrap();
-            *g = Some(socket.clone());
-        }
         let (tx, _) = broadcast::channel(64);
-        Ok(Self { socket, events: tx, port })
+        let net_config = detect_net();
+        let ext_id_part = {
+            let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            format!("{:016x}", t as u64)
+        };
+        Ok(Self {
+            socket,
+            events: tx,
+            port,
+            text_encoding: RwLock::new(TextEncoding::Gb18030),
+            user_info: RwLock::new(UserInfo {
+                username: whoami::username(),
+                hostname: hostname::get()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "host".into()),
+                group: "".to_string(),
+            }),
+            net_config,
+            ext_id_part,
+            file_table: Mutex::new(HashMap::new()),
+            packet_no_seq: AtomicU32::new(1),
+            cancel_flags: Mutex::new(HashMap::new()),
+        })
     }
 
-    pub async fn spawn(&self) -> Result<()> {
+    // ---- 编码 / 本机信息 ----
+
+    pub fn set_text_encoding(&self, encoding: TextEncoding) {
+        let mut current = self.text_encoding.write().unwrap();
+        *current = encoding;
+    }
+
+    pub fn set_user_info(&self, name: &str, group: &str) {
+        let mut info = self.user_info.write().unwrap();
+        info.username = name.to_string();
+        info.group = group.to_string();
+    }
+
+    fn current_text_encoding(&self) -> TextEncoding {
+        *self.text_encoding.read().unwrap()
+    }
+
+    fn encode_text(&self, s: &str) -> Vec<u8> {
+        encode_text(self.current_text_encoding(), s)
+    }
+
+    fn decode_text(&self, buf: &[u8]) -> String {
+        decode_text(self.current_text_encoding(), buf)
+    }
+
+    fn encode_packet(&self, packet: &Packet) -> Vec<u8> {
+        packet.encode(self.current_text_encoding())
+    }
+
+    fn parse_packet(&self, buf: &[u8]) -> Result<Packet> {
+        parse_packet(buf, self.current_text_encoding())
+    }
+
+    fn build_user_extra(&self) -> String {
+        let info = self.user_info.read().unwrap();
+        let mut extra = String::new();
+        extra.push_str(&info.username);
+        extra.push('\0');
+        extra.push_str(&info.group);
+        extra.push('\0');
+        extra.push_str("UN:");
+        extra.push_str(&format!("{}-<{}>", info.username, self.ext_id_part));
+        extra.push('\0');
+        extra.push_str("HN:");
+        extra.push_str(&info.hostname);
+        extra.push('\0');
+        extra.push_str("NN:");
+        extra.push_str(&info.username);
+        extra.push('\0');
+        extra.push_str("GN:");
+        extra.push_str(&info.group);
+        extra.push('\0');
+        extra.push_str("VS:00010002:5:7:2");
+        extra
+    }
+
+    fn current_user_identity(&self) -> (String, String) {
+        let info = self.user_info.read().unwrap();
+        (info.username.clone(), info.hostname.clone())
+    }
+
+    // ---- 启动 ----
+
+    pub async fn spawn(self: &Arc<Self>) -> Result<()> {
         self.broadcast_entry().await?;
+        let me = Arc::clone(self);
+        let me_tcp = Arc::clone(&me);
         let socket = self.socket.clone();
         let tx_udp = self.events.clone();
-        let tx_tcp = self.events.clone();
         let port = self.port;
         tokio::spawn(async move {
             let mut buf = [0u8; 8192];
@@ -378,7 +406,7 @@ impl Service {
                 match socket.recv_from(&mut buf).await {
                     Ok((n, from)) => {
                         let data = &buf[..n];
-                        match parse_packet(data) {
+                        match me.parse_packet(data) {
                             Ok(p) => {
                                 let base = p.command & 0x000000ff;
                                 let opts = p.command & !0x000000ff;
@@ -389,10 +417,10 @@ impl Service {
                                             p.packet_no, p.username, p.hostname, from, p.extra
                                         );
                                         let (user, group) = parse_entry_extra(&p.username, &p.extra);
-                                        if addr_allowed(&from) {
+                                        if me.addr_allowed(&from) {
                                             let _ = tx_udp.send(Event::Online { user, group, host: p.hostname.clone(), addr: from });
                                         }
-                                        let _ = send_ansentry(&socket, from).await;
+                                        let _ = me.send_ansentry(from).await;
                                     }
                                     IPMSG_ANSENTRY => {
                                         info!(
@@ -400,7 +428,7 @@ impl Service {
                                             p.packet_no, p.username, p.hostname, from, p.extra
                                         );
                                         let (user, group) = parse_entry_extra(&p.username, &p.extra);
-                                        if addr_allowed(&from) {
+                                        if me.addr_allowed(&from) {
                                             let _ = tx_udp.send(Event::Online { user, group, host: p.hostname.clone(), addr: from });
                                         }
                                     }
@@ -409,7 +437,7 @@ impl Service {
                                             "recv BR_EXIT id={} from {}@{} ({})",
                                             p.packet_no, p.username, p.hostname, from
                                         );
-                                        if addr_allowed(&from) {
+                                        if me.addr_allowed(&from) {
                                             let _ = tx_udp.send(Event::Offline { user: p.username.clone(), host: p.hostname.clone(), addr: from });
                                         }
                                     }
@@ -434,7 +462,7 @@ impl Service {
                                                 "recv SENDMSG id={} from {}@{} ({}) sealed={} encrypted={} text='{}' ext={:?}",
                                                 p.packet_no, p.username, p.hostname, from, sealed, encrypted, main_text, ext
                                             );
-                                            if addr_allowed(&from) {
+                                            if me.addr_allowed(&from) {
                                                 let text = if encrypted {
                                                     "[加密消息，暂不支持解密]".to_string()
                                                 } else {
@@ -485,10 +513,10 @@ impl Service {
                                             );
                                         }
                                         if need_check {
-                                            let _ = send_recvmsg(&socket, p.packet_no, from).await;
+                                            let _ = me.send_recvmsg(p.packet_no, from).await;
                                         }
                                         if sealed {
-                                            let _ = send_readmsg(&socket, p.packet_no, from).await;
+                                            let _ = me.send_readmsg(p.packet_no, from).await;
                                         }
                                     }
                                     IPMSG_RECVMSG => {
@@ -497,7 +525,7 @@ impl Service {
                                             "recv RECVMSG id={} from {}@{} ({}) packet_no={}",
                                             p.packet_no, p.username, p.hostname, from, main
                                         );
-                                        if addr_allowed(&from) {
+                                        if me.addr_allowed(&from) {
                                             // main is the packet_no of the SENDMSG we sent to this
                                             // peer; deliver it as a delivery confirmation.
                                             let acked = parse_u32_auto_radix(&main);
@@ -522,7 +550,7 @@ impl Service {
                                             from,
                                             String::from_utf8_lossy(data)
                                         );
-                                        if addr_allowed(&from) {
+                                        if me.addr_allowed(&from) {
                                             let _ = tx_udp.send(Event::Unknown { from, raw: String::from_utf8_lossy(data).to_string() });
                                         }
                                     }
@@ -535,7 +563,7 @@ impl Service {
                                             e,
                                             String::from_utf8_lossy(data)
                                         );
-                                if addr_allowed(&from) {
+                                if me.addr_allowed(&from) {
                                     let _ = tx_udp.send(Event::Unknown { from, raw: String::from_utf8_lossy(data).to_string() });
                                 }
                             }
@@ -569,9 +597,9 @@ impl Service {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
-                        let tx = tx_tcp.clone();
+                        let me = Arc::clone(&me_tcp);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_tcp_file(stream, addr, tx).await {
+                            if let Err(e) = me.handle_tcp_file(stream, addr).await {
                                 warn!("tcp file handler error from {}: {}", addr, e);
                             }
                         });
@@ -586,123 +614,112 @@ impl Service {
     }
 
     async fn broadcast_entry(&self) -> Result<()> {
-        let (username, hostname) = {
-            let info = USER_INFO.read().unwrap();
-            (info.username.clone(), info.hostname.clone())
-        };
-        let extra = build_user_extra();
+        let (username, hostname) = self.current_user_identity();
+        let extra = self.build_user_extra();
         let packet = Packet {
             version: VER,
-            packet_no: now_millis(),
+            packet_no: self.now_millis(),
             username,
             hostname,
             command: IPMSG_BR_ENTRY,
             extra,
         };
-        let addr = broadcast_target();
-        self.socket.send_to(&packet.encode(), addr).await?;
+        let addr = self.broadcast_target();
+        self.socket.send_to(&self.encode_packet(&packet), addr).await?;
         info!("BR_ENTRY sent id={} to {}", packet.packet_no, addr);
         Ok(())
     }
-}
 
-fn now_millis() -> u32 {
-    const MAX_PACKET_NO: u32 = 0x7fff_ffff;
-    loop {
-        let current = PACKET_NO_SEQ.load(Ordering::Relaxed);
-        let current = if current == 0 || current > MAX_PACKET_NO {
-            1
-        } else {
-            current
-        };
-        let next = if current >= MAX_PACKET_NO { 1 } else { current + 1 };
-        if PACKET_NO_SEQ
-            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return current;
-        }
-    }
-}
-
-async fn send_ansentry(socket: &UdpSocket, to: SocketAddr) -> Result<()> {
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let extra = build_user_extra();
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_ANSENTRY,
-        extra,
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    Ok(())
-}
-
-async fn send_recvmsg(socket: &UdpSocket, packet_no: u32, to: SocketAddr) -> Result<()> {
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_RECVMSG,
-        extra: packet_no.to_string(),
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    info!(
-        "RECVMSG sent id={} to {} packet_no={}",
-        packet.packet_no, to, packet_no
-    );
-    Ok(())
-}
-
-async fn send_readmsg(socket: &UdpSocket, packet_no: u32, to: SocketAddr) -> Result<()> {
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_READMSG,
-        extra: packet_no.to_string(),
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    info!(
-        "READMSG sent id={} to {} packet_no={}",
-        packet.packet_no, to, packet_no
-    );
-    Ok(())
-}
-
-fn whoami() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "user".into())
-}
-
-fn addr_allowed(addr: &SocketAddr) -> bool {
-    if let Ok(prefix) = std::env::var("IPMSG_NET_PREFIX") {
-        if let SocketAddr::V4(v4) = addr {
-            let ip_str = v4.ip().to_string();
-            if !ip_str.starts_with(&prefix) {
-                info!(
-                    "ignore packet from {} not in prefix {}",
-                    ip_str, prefix
-                );
-                return false;
+    fn now_millis(&self) -> u32 {
+        const MAX_PACKET_NO: u32 = 0x7fff_ffff;
+        loop {
+            let current = self.packet_no_seq.load(Ordering::Relaxed);
+            let current = if current == 0 || current > MAX_PACKET_NO {
+                1
+            } else {
+                current
+            };
+            let next = if current >= MAX_PACKET_NO { 1 } else { current + 1 };
+            if self
+                .packet_no_seq
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return current;
             }
         }
-    } else if let SocketAddr::V4(v4) = addr {
-        if let Some((ref prefix, _)) = *NET_CONFIG {
+    }
+
+    async fn send_ansentry(&self, to: SocketAddr) -> Result<()> {
+        let (username, hostname) = self.current_user_identity();
+        let extra = self.build_user_extra();
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_ANSENTRY,
+            extra,
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        Ok(())
+    }
+
+    async fn send_recvmsg(&self, packet_no: u32, to: SocketAddr) -> Result<()> {
+        let (username, hostname) = self.current_user_identity();
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_RECVMSG,
+            extra: packet_no.to_string(),
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        info!(
+            "RECVMSG sent id={} to {} packet_no={}",
+            packet.packet_no, to, packet_no
+        );
+        Ok(())
+    }
+
+    async fn send_readmsg(&self, packet_no: u32, to: SocketAddr) -> Result<()> {
+        let (username, hostname) = self.current_user_identity();
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_READMSG,
+            extra: packet_no.to_string(),
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        info!(
+            "READMSG sent id={} to {} packet_no={}",
+            packet.packet_no, to, packet_no
+        );
+        Ok(())
+    }
+
+    fn whoami() -> String {
+        std::env::var("USER").unwrap_or_else(|_| "user".into())
+    }
+
+    fn addr_allowed(&self, addr: &SocketAddr) -> bool {
+        if let Ok(prefix) = std::env::var("IPMSG_NET_PREFIX") {
+            if let SocketAddr::V4(v4) = addr {
+                let ip_str = v4.ip().to_string();
+                if !ip_str.starts_with(&prefix) {
+                    info!(
+                        "ignore packet from {} not in prefix {}",
+                        ip_str, prefix
+                    );
+                    return false;
+                }
+            }
+        } else if let SocketAddr::V4(v4) = addr
+            && let Some((ref prefix, _)) = self.net_config
+        {
             let ip_str = v4.ip().to_string();
             if !ip_str.starts_with(prefix) {
                 info!(
@@ -712,20 +729,959 @@ fn addr_allowed(addr: &SocketAddr) -> bool {
                 return false;
             }
         }
+        true
     }
-    true
-}
 
-fn broadcast_target() -> SocketAddr {
-    if let Ok(s) = std::env::var("IPMSG_BROADCAST_ADDR") {
-        if let Ok(ip) = s.parse::<Ipv4Addr>() {
+    fn broadcast_target(&self) -> SocketAddr {
+        if let Ok(s) = std::env::var("IPMSG_BROADCAST_ADDR")
+            && let Ok(ip) = s.parse::<Ipv4Addr>()
+        {
             return SocketAddr::new(IpAddr::V4(ip), PORT);
         }
+        if let Some((_, bcast)) = self.net_config {
+            return SocketAddr::new(IpAddr::V4(bcast), PORT);
+        }
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), PORT)
     }
-    if let Some((_, bcast)) = *NET_CONFIG {
-        return SocketAddr::new(IpAddr::V4(bcast), PORT);
+
+    pub async fn send_broadcast_entry(&self) -> Result<()> {
+        let (username, hostname) = self.current_user_identity();
+        let extra = self.build_user_extra();
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_BR_ENTRY,
+            extra,
+        };
+        let addr = self.broadcast_target();
+        self.socket.send_to(&self.encode_packet(&packet), addr).await?;
+        info!("BR_ENTRY sent id={} to {}", packet.packet_no, addr);
+        Ok(())
     }
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), PORT)
+
+    pub async fn send_exit(&self) -> Result<()> {
+        let (username, hostname) = self.current_user_identity();
+        let extra = self.build_user_extra();
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_BR_EXIT,
+            extra,
+        };
+        let addr = self.broadcast_target();
+        self.socket.send_to(&self.encode_packet(&packet), addr).await?;
+        info!("BR_EXIT sent id={} to {}", packet.packet_no, addr);
+        Ok(())
+    }
+
+    pub async fn send_exit_to(&self, to: SocketAddr) -> Result<()> {
+        let (username, hostname) = self.current_user_identity();
+        let extra = self.build_user_extra();
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_BR_EXIT,
+            extra,
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        info!("BR_EXIT sent id={} to {}", packet.packet_no, to);
+        Ok(())
+    }
+
+    /// Send a text message; returns the packet_no used, which the peer echoes
+    /// back in RECVMSG so the caller can track delivery status.
+    pub async fn send_message(&self, to: SocketAddr, text: String) -> Result<u32> {
+        let (username, hostname) = self.current_user_identity();
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT,
+            extra: text,
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        info!(
+            "SENDMSG sent id={} to {} text='{}'",
+            packet.packet_no, to, packet.extra
+        );
+        Ok(packet.packet_no)
+    }
+
+    pub async fn send_file(&self, to: SocketAddr, path: String) -> Result<()> {
+        let (username, hostname) = self.current_user_identity();
+        let meta = fs::metadata(&path).await?;
+        let file_size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let file_name = PathBuf::from(&path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .replace(':', "::");
+        let file_id = loop {
+            let id = random_file_id();
+            if id != 0 {
+                break id;
+            }
+        };
+        let packet_no = self.now_millis();
+        {
+            let mut table = self.file_table.lock().unwrap();
+            if table.contains_key(&(packet_no, file_id)) {
+                return Err(anyhow!("file id collision, retry transfer"));
+            }
+            table.insert(
+                (packet_no, file_id),
+                FileEntry {
+                    to: to.ip(),
+                    path: PathBuf::from(&path),
+                    size: file_size,
+                    is_dir: false,
+                },
+            );
+        }
+        let size_hex = format!("{:x}", file_size);
+        let mtime_hex = format!("{:x}", mtime);
+        let attr_hex = format!("{:x}", IPMSG_FILE_REGULAR);
+        // Per spec, only size/mtime/fileattr are hex; fileID is decimal
+        // (protocol.txt §5, draft 14).
+        let file_info = format!(
+            "{}:{}:{}:{}:{}:\x07",
+            file_id, file_name, size_hex, mtime_hex, attr_hex
+        );
+        let mut extra = String::new();
+        extra.push_str("");
+        extra.push('\0');
+        extra.push_str(&file_info);
+        let packet = Packet {
+            version: VER,
+            packet_no,
+            username,
+            hostname,
+            command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_FILEATTACHOPT,
+            extra,
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        info!(
+            "SENDMSG(FILE) sent id={} to {} file='{}' size={}",
+            packet.packet_no, to, path, file_size
+        );
+        Ok(())
+    }
+
+    pub async fn send_files(&self, to: SocketAddr, paths: Vec<String>) -> Result<Vec<SentFileMeta>> {
+        let (username, hostname) = self.current_user_identity();
+
+        let mut valid_files = Vec::new();
+        for path in paths {
+            if let Ok(meta) = fs::metadata(&path).await
+                && meta.is_file()
+            {
+                valid_files.push((path, meta));
+            }
+        }
+
+        if valid_files.is_empty() {
+            return Err(anyhow!("No valid files to send"));
+        }
+
+        let packet_no = self.now_millis();
+        let mut file_infos = String::new();
+        let mut sent_items = Vec::new();
+
+        {
+            let mut table = self.file_table.lock().unwrap();
+            for (path, meta) in valid_files.iter() {
+                let file_size = meta.len();
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let file_name = PathBuf::from(path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .replace(':', "::");
+
+                let file_id = loop {
+                    let id = random_file_id();
+                    if id != 0 && !table.contains_key(&(packet_no, id)) {
+                        break id;
+                    }
+                };
+
+                table.insert(
+                    (packet_no, file_id),
+                    FileEntry {
+                        to: to.ip(),
+                        path: PathBuf::from(path),
+                        size: file_size,
+                        is_dir: false,
+                    },
+                );
+                sent_items.push(SentFileMeta {
+                    packet_no,
+                    file_id,
+                    path: path.clone(),
+                    name: file_name.clone(),
+                    size: file_size,
+                    is_dir: false,
+                });
+
+                let size_hex = format!("{:x}", file_size);
+                let mtime_hex = format!("{:x}", mtime);
+                let attr_hex = format!("{:x}", IPMSG_FILE_REGULAR);
+                let info = format!(
+                    "{}:{}:{}:{}:{}:\x07",
+                    file_id, file_name, size_hex, mtime_hex, attr_hex
+                );
+                file_infos.push_str(&info);
+            }
+        }
+
+        let mut extra = String::new();
+        extra.push_str("");
+        extra.push('\0');
+        extra.push_str(&file_infos);
+
+        let packet = Packet {
+            version: VER,
+            packet_no,
+            username,
+            hostname,
+            command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_FILEATTACHOPT,
+            extra,
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        info!(
+            "SENDMSG(FILES) sent id={} to {} count={}",
+            packet.packet_no, to, valid_files.len()
+        );
+        Ok(sent_items)
+    }
+
+    pub async fn send_folder(&self, to: SocketAddr, dir: String) -> Result<SentFileMeta> {
+        let (username, hostname) = self.current_user_identity();
+        let meta = fs::metadata(&dir).await?;
+        if !meta.is_dir() {
+            return Err(anyhow!("send_folder path is not directory"));
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir_name = PathBuf::from(&dir)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dir")
+            .replace(':', "::");
+        let file_id = loop {
+            let id = random_file_id();
+            if id != 0 {
+                break id;
+            }
+        };
+        let packet_no = self.now_millis();
+        {
+            let mut table = self.file_table.lock().unwrap();
+            if table.contains_key(&(packet_no, file_id)) {
+                return Err(anyhow!("file id collision, retry transfer"));
+            }
+            table.insert(
+                (packet_no, file_id),
+                FileEntry {
+                    to: to.ip(),
+                    path: PathBuf::from(&dir),
+                    size: 0,
+                    is_dir: true,
+                },
+            );
+        }
+        let size_hex = format!("{:x}", 0u64);
+        let mtime_hex = format!("{:x}", mtime);
+        let attr_hex = format!("{:x}", IPMSG_FILE_DIR);
+        let file_info = format!(
+            "{}:{}:{}:{}:{}:\x07",
+            file_id, dir_name, size_hex, mtime_hex, attr_hex
+        );
+        let text = format!("[文件夹] {}", dir_name);
+        let mut extra = String::new();
+        extra.push_str(&text);
+        extra.push('\0');
+        extra.push_str(&file_info);
+        let packet = Packet {
+            version: VER,
+            packet_no,
+            username,
+            hostname,
+            command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_FILEATTACHOPT,
+            extra,
+        };
+        self.socket.send_to(&self.encode_packet(&packet), to).await?;
+        info!(
+            "SENDMSG(DIR) sent id={} to {} dir='{}'",
+            packet.packet_no, to, dir
+        );
+        Ok(SentFileMeta {
+            packet_no,
+            file_id,
+            path: dir,
+            name: dir_name,
+            size: 0,
+            is_dir: true,
+        })
+    }
+
+    // ---- 接收文件 ----
+
+    /// 单次 GETFILEDATA 尝试：hex / decimal 两种扩展部格式各试一次（协议规范
+    /// §5 为 hex，部分国产客户端按 decimal 回显）。参数均为调用方区分两版协议
+    /// 行为所需，故不拆分。
+    #[allow(clippy::too_many_arguments)]
+    async fn recv_file_once<F>(
+        &self,
+        from: SocketAddr,
+        packet_no: u32,
+        file_id: u32,
+        save_path: &str,
+        use_hex: bool,
+        expected_size: u64,
+        on_progress: &mut F,
+    ) -> Result<u64>
+    where
+        F: FnMut(u64),
+    {
+        let mut stream = TcpStream::connect(from).await?;
+        let (username, hostname) = self.current_user_identity();
+        let extra = if use_hex {
+            format!("{:x}:{:x}:0", packet_no, file_id)
+        } else {
+            format!("{}:{}:0", packet_no, file_id)
+        };
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_GETFILEDATA,
+            extra,
+        };
+        let buf = self.encode_packet(&packet);
+        stream.write_all(&buf).await?;
+        let mut file = fs::File::create(save_path).await?;
+        let mut buf = [0u8; 8192];
+        let mut total: u64 = 0;
+        loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).await?;
+            total += n as u64;
+            on_progress(total);
+            if expected_size > 0 && total >= expected_size {
+                break;
+            }
+        }
+        info!(
+            "RECVFILE attempt mode={} from {} packet_no={} (0x{:x}) file_id={} (0x{:x}) size={} path='{}'",
+            if use_hex { "hex" } else { "dec" },
+            from,
+            packet_no,
+            packet_no,
+            file_id,
+            file_id,
+            total,
+            save_path
+        );
+        if expected_size > 0 && total < expected_size {
+            return Err(anyhow!(
+                "incomplete file transfer: expected {} bytes, got {}",
+                expected_size,
+                total
+            ));
+        }
+        Ok(total)
+    }
+
+    pub async fn recv_file<F>(
+        &self,
+        from: SocketAddr,
+        packet_no: u32,
+        file_id: u32,
+        expected_size: u64,
+        save_path: String,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64) + Send,
+    {
+        info!("recv_file start from {} packet_no={} file_id={}", from, packet_no, file_id);
+        let first_try = self
+            .recv_file_once(
+                from,
+                packet_no,
+                file_id,
+                &save_path,
+                true, // use hex
+                expected_size,
+                &mut on_progress,
+            )
+            .await;
+        if first_try.is_err() {
+            info!(
+                "recv_file retry with decimal mode from {} packet_no={} file_id={}",
+                from, packet_no, file_id
+            );
+            self.recv_file_once(
+                from,
+                packet_no,
+                file_id,
+                &save_path,
+                false, // retry with decimal
+                expected_size,
+                &mut on_progress,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn recv_folder<F>(
+        &self,
+        from: SocketAddr,
+        packet_no: u32,
+        file_id: u32,
+        save_path: String,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64, String) + Send,
+    {
+        info!("recv_folder start from {} packet_no={} file_id={}", from, packet_no, file_id);
+        let mut stream = TcpStream::connect(from).await?;
+        let (username, hostname) = self.current_user_identity();
+        // For folder, extra format is packet_no:file_id:0 (same as file?)
+        // Actually spec says just packet_no:file_id. The 3rd field is offset, usually 0.
+        let extra = format!("{:x}:{:x}:0", packet_no, file_id);
+
+        let packet = Packet {
+            version: VER,
+            packet_no: self.now_millis(),
+            username,
+            hostname,
+            command: IPMSG_GETDIRFILES,
+            extra,
+        };
+        let buf = self.encode_packet(&packet);
+        stream.write_all(&buf).await?;
+
+        let mut path_stack = vec![PathBuf::from(&save_path)];
+        // Ensure the root save_path exists (it should be created by the caller? No, we are creating the folder structure inside it?
+        // Wait, save_path INCLUDES the folder name. So we should create it.
+        if !std::path::Path::new(&save_path).exists() {
+            fs::create_dir_all(&save_path).await?;
+        }
+
+        let mut total_received: u64 = 0;
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut is_first_entry = true;
+
+        loop {
+            // Read header size (hex string until ':')
+            let mut size_buf = Vec::new();
+            loop {
+                let mut b = [0u8; 1];
+                let n = reader.read(&mut b).await?;
+                if n == 0 {
+                    // End of stream. If no entry was received, treat it as canceled/unavailable.
+                    if is_first_entry {
+                        return Err(anyhow!("no folder data received"));
+                    }
+                    return Ok(());
+                }
+                if b[0] == b':' {
+                    break;
+                }
+                size_buf.push(b[0]);
+                if size_buf.len() > 10 { // Safety limit
+                     return Err(anyhow!("Header size too long"));
+                }
+            }
+
+            let size_str = String::from_utf8_lossy(&size_buf);
+            let header_len = u32::from_str_radix(&size_str, 16)?;
+
+            // 2. Read the rest of the header
+            // We already read size_buf.len() + 1 bytes
+            let remaining_header_len = header_len as usize - size_buf.len() - 1;
+            let mut header_buf = vec![0u8; remaining_header_len];
+            reader.read_exact(&mut header_buf).await?;
+
+            // Parse header: filename:size:type:attrs...
+            // Decode header string (GB18030 usually)
+            let header_str = self.decode_text(&header_buf);
+            let parts: Vec<&str> = header_str.split(':').collect();
+
+            if parts.len() < 3 {
+                 return Err(anyhow!("Invalid folder header"));
+            }
+
+            // Handle potential leading colon (which results in empty first part)
+            let (filename, file_size_str, file_type_str) = if parts[0].is_empty() && parts.len() >= 4 {
+                 (parts[1], parts[2], parts[3])
+            } else if !parts[0].is_empty() && parts.len() >= 3 {
+                 (parts[0], parts[1], parts[2])
+            } else {
+                 return Err(anyhow!("Invalid folder header: {:?}", header_str));
+            };
+
+            let file_size = u64::from_str_radix(file_size_str, 16).map_err(|e| anyhow!("Invalid file size: {} ({})", file_size_str, e))?;
+            let file_type = u32::from_str_radix(file_type_str, 16).map_err(|e| anyhow!("Invalid file type: {} ({})", file_type_str, e))?;
+
+            let current_is_first = is_first_entry;
+            is_first_entry = false;
+
+            match file_type {
+                IPMSG_FILE_REGULAR => {
+                    let Some(filename) = sanitize_wire_filename(filename) else {
+                        return Err(anyhow!(
+                            "refused unsafe filename in folder transfer: {:?}",
+                            header_str
+                        ));
+                    };
+                    if let Some(current_dir) = path_stack.last() {
+                        let file_path = current_dir.join(filename);
+                        let mut file = fs::File::create(&file_path).await?;
+                        // Notify UI immediately when a new file header is parsed,
+                        // so filename switches without waiting for first data chunk.
+                        on_progress(total_received, filename.to_string());
+
+                        // Read file content
+                        let mut received = 0u64;
+                        let mut buf = [0u8; 8192];
+                        while received < file_size {
+                            let to_read = std::cmp::min(buf.len() as u64, file_size - received) as usize;
+                            let n = reader.read(&mut buf[..to_read]).await?;
+                            if n == 0 {
+                                return Err(anyhow!("Unexpected EOF during file content"));
+                            }
+                            file.write_all(&buf[..n]).await?;
+                            received += n as u64;
+                            total_received += n as u64;
+                            on_progress(total_received, filename.to_string());
+                        }
+                    }
+                }
+                IPMSG_FILE_DIR => {
+                    if current_is_first {
+                        // IPMSG protocol sends the root directory header first.
+                        // Since 'save_path' already includes the folder name (e.g. .../Downloads/FolderName),
+                        // we treat this first header as the root directory itself, not a subdirectory.
+                        // We simply skip creating a new directory level to avoid double nesting (FolderName/FolderName).
+                        // This effectively maps the sender's root folder name to our local 'save_path'.
+                        continue;
+                    }
+                    let Some(filename) = sanitize_wire_filename(filename) else {
+                        return Err(anyhow!(
+                            "refused unsafe directory name in folder transfer: {:?}",
+                            header_str
+                        ));
+                    };
+                    if let Some(current_dir) = path_stack.last() {
+                        let dir_path = current_dir.join(filename);
+                        if !dir_path.exists() {
+                            fs::create_dir(&dir_path).await?;
+                        }
+                        path_stack.push(dir_path);
+                    }
+                }
+                IPMSG_FILE_RETPARENT => {
+                    if filename == "." {
+                       // Some clients send "." for RETPARENT?
+                       // Just pop
+                    }
+                    path_stack.pop();
+                }
+                _ => {
+                    // Ignore other types or handle if needed
+                    // If it has content size, we must skip it
+                    if file_size > 0 {
+                        let mut skipped = 0u64;
+                        let mut buf = [0u8; 8192];
+                        while skipped < file_size {
+                            let to_read = std::cmp::min(buf.len() as u64, file_size - skipped) as usize;
+                            let n = reader.read(&mut buf[..to_read]).await?;
+                            if n == 0 { break; }
+                            skipped += n as u64;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 发送文件（TCP 服务侧） ----
+
+    async fn write_dir_header(
+        &self,
+        stream: &mut TcpStream,
+        filename: &str,
+        file_attr: u32,
+        file_size: u64,
+        mtime: u64,
+    ) -> Result<()> {
+        let ts = if mtime == 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        } else {
+            mtime
+        };
+        let mut header = String::new();
+        header.push(':');
+        header.push_str(filename);
+        header.push(':');
+        header.push_str(&format!("{:x}", file_size));
+        header.push(':');
+        header.push_str(&format!("{:x}", file_attr));
+        header.push(':');
+        header.push_str(&format!("{:x}={:x}", IPMSG_FILE_CREATETIME, ts));
+        header.push(':');
+        header.push_str(&format!("{:x}={:x}", IPMSG_FILE_MTIME, ts));
+        header.push(':');
+        let header_bytes = self.encode_text(&header);
+        let header_len = header_bytes.len();
+        let total_len = header_len + 4;
+        let len_hex = format!("{:0>4x}", total_len);
+        let mut out = len_hex.into_bytes();
+        out.extend_from_slice(&header_bytes);
+        stream.write_all(&out).await?;
+        Ok(())
+    }
+
+    fn send_dir_children<'a>(
+        &'a self,
+        stream: &'a mut TcpStream,
+        dir: PathBuf,
+        cancel_token: Arc<AtomicBool>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut entries = fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if cancel_token.load(Ordering::SeqCst) {
+                    return Err(anyhow!("send canceled"));
+                }
+                let path = entry.path();
+                let meta = entry.metadata().await?;
+                if meta.is_dir() {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("dir");
+                    self.write_dir_header(stream, name, IPMSG_FILE_DIR, 0, mtime).await?;
+                    self.send_dir_children(stream, path.clone(), cancel_token.clone()).await?;
+                    self.write_dir_header(stream, ".", IPMSG_FILE_RETPARENT, 0, 0).await?;
+                } else if meta.is_file() {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("file");
+                    // Never emit entries whose name we would refuse on the receive
+                    // side (e.g. NTFS alternate data streams like "f.txt:ads").
+                    if sanitize_wire_filename(name).is_none() {
+                        warn!("skip sending entry with unsafe name: {:?}", path);
+                        continue;
+                    }
+                    let size = meta.len();
+                    self.write_dir_header(stream, name, IPMSG_FILE_REGULAR, size, mtime).await?;
+                    let mut file = fs::File::open(&path).await?;
+                    let mut buf = [0u8; 8192];
+                    let mut sent: u64 = 0;
+                    loop {
+                        if cancel_token.load(Ordering::SeqCst) {
+                            return Err(anyhow!("send canceled"));
+                        }
+                        let n = file.read(&mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        stream.write_all(&buf[..n]).await?;
+                        sent += n as u64;
+                        if sent >= size {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    async fn send_dir_hierarchy(
+        &self,
+        stream: &mut TcpStream,
+        root: &PathBuf,
+        cancel_token: Arc<AtomicBool>,
+    ) -> Result<()> {
+        if cancel_token.load(Ordering::SeqCst) {
+            return Err(anyhow!("send canceled"));
+        }
+        let root_name = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dir");
+        let meta = fs::metadata(root).await?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.write_dir_header(stream, root_name, IPMSG_FILE_DIR, 0, mtime).await?;
+        self.send_dir_children(stream, root.clone(), cancel_token.clone()).await?;
+        self.write_dir_header(stream, ".", IPMSG_FILE_RETPARENT, 0, 0).await?;
+        Ok(())
+    }
+
+    fn send_cancel_token(&self, peer: IpAddr, packet_no: u32, file_id: u32) -> Arc<AtomicBool> {
+        let mut flags = self.cancel_flags.lock().unwrap();
+        flags
+            .entry((peer, packet_no, file_id))
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    fn clear_send_cancel_token(&self, peer: IpAddr, packet_no: u32, file_id: u32) {
+        self.cancel_flags
+            .lock()
+            .unwrap()
+            .remove(&(peer, packet_no, file_id));
+    }
+
+    pub fn cancel_send(&self, to: SocketAddr, packet_no: u32, file_id: u32) -> bool {
+        let removed = self.file_table.lock().unwrap().remove(&(packet_no, file_id)).is_some();
+        let token = self.send_cancel_token(to.ip(), packet_no, file_id);
+        token.store(true, Ordering::SeqCst);
+        removed
+    }
+
+    async fn handle_tcp_file(&self, mut stream: TcpStream, peer_addr: SocketAddr) -> Result<()> {
+        info!("handle_tcp_file");
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let header = &buf[..n];
+        let packet = self.parse_packet(header)?;
+        let base = packet.command & 0x000000ff;
+        if base == IPMSG_GETFILEDATA {
+            let parts: Vec<&str> = packet.extra.split(':').collect();
+            if parts.len() < 3 {
+                return Err(anyhow!("bad GETFILEDATA extra"));
+            }
+            let (pkt_no, file_id, entry) = {
+                let table = self.file_table.lock().unwrap();
+                info!("handle_tcp_file table={:?}", table);
+                match lookup_file_entry(&table, parts[0], parts[1]) {
+                    Some((p, f, e)) => (p, f, Some(e)),
+                    None => (0, 0, None),
+                }
+            };
+            let offset = parse_u64_auto_radix(parts[2].trim());
+            info!("handle_tcp_file packet_no={:x} file_id={:x} offset={:x} {:?}", pkt_no, file_id, offset, entry);
+            if let Some(entry) = entry {
+                // Only the peer the file was offered to may download it (P0-3).
+                // Compare by IP: the TCP client connects from an ephemeral port,
+                // so full socket equality never matches.
+                if entry.to != peer_addr.ip() {
+                    warn!(
+                        "denied GETFILEDATA ({:x},{:x}) from {}: not intended recipient {:?}",
+                        pkt_no, file_id, peer_addr.ip(), entry.to
+                    );
+                    return Err(anyhow!("file request not authorized"));
+                }
+                if entry.is_dir {
+                    return Ok(());
+                }
+                let cancel_token = self.send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+                if cancel_token.load(Ordering::SeqCst) {
+                    self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+                    return Err(anyhow!("send canceled"));
+                }
+                let _ = self.events.send(Event::FileServingStarted {
+                    to: peer_addr,
+                    packet_no: pkt_no,
+                    file_id,
+                    is_dir: false,
+                });
+                let mut file = fs::File::open(&entry.path).await?;
+                if offset > 0 {
+                    file.seek(std::io::SeekFrom::Start(offset)).await?;
+                }
+                let mut buf = [0u8; 8192];
+                let send_result: Result<()> = async {
+                    loop {
+                        if cancel_token.load(Ordering::SeqCst) {
+                            return Err(anyhow!("send canceled"));
+                        }
+                        let n = file.read(&mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        stream.write_all(&buf[..n]).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(err) = send_result {
+                    self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+                    return Err(err);
+                }
+                info!(
+                    "SENDFILE done packet_no={:x} file_id={:x} path='{}'",
+                    pkt_no,
+                    file_id,
+                    entry.path.to_string_lossy()
+                );
+                let _ = self.events.send(Event::FileServed {
+                    to: peer_addr,
+                    packet_no: pkt_no,
+                    file_id,
+                    is_dir: false,
+                });
+                self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+            }
+            return Ok(());
+        }
+        if base == IPMSG_GETDIRFILES {
+            let parts: Vec<&str> = packet.extra.split(':').collect();
+            if parts.len() < 2 {
+                return Err(anyhow!("bad GETDIRFILES extra"));
+            }
+            let (pkt_no, file_id, entry) = {
+                let table = self.file_table.lock().unwrap();
+                match lookup_file_entry(&table, parts[0], parts[1]) {
+                    Some((p, f, e)) => (p, f, Some(e)),
+                    None => (0, 0, None),
+                }
+            };
+            let _offset = if parts.len() >= 3 {
+                parse_u64_auto_radix(parts[2].trim())
+            } else {
+                0
+            };
+            if let Some(entry) = entry {
+                // Only the peer the file was offered to may download it (P0-3).
+                if entry.to != peer_addr.ip() {
+                    warn!(
+                        "denied GETDIRFILES ({:x},{:x}) from {}: not intended recipient {:?}",
+                        pkt_no, file_id, peer_addr.ip(), entry.to
+                    );
+                    return Err(anyhow!("file request not authorized"));
+                }
+                if entry.is_dir {
+                    let cancel_token = self.send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+                    if cancel_token.load(Ordering::SeqCst) {
+                        self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+                        return Err(anyhow!("send canceled"));
+                    }
+                    let _ = self.events.send(Event::FileServingStarted {
+                        to: peer_addr,
+                        packet_no: pkt_no,
+                        file_id,
+                        is_dir: true,
+                    });
+                    let send_result =
+                        self.send_dir_hierarchy(&mut stream, &entry.path, cancel_token.clone()).await;
+                    if let Err(err) = send_result {
+                        self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+                        return Err(err);
+                    }
+                    info!(
+                        "SENDDIR done packet_no={:x} file_id={:x} path='{}'",
+                        pkt_no,
+                        file_id,
+                        entry.path.to_string_lossy()
+                    );
+                    let _ = self.events.send(Event::FileServed {
+                        to: peer_addr,
+                        packet_no: pkt_no,
+                        file_id,
+                        is_dir: true,
+                    });
+                    self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Peers echo packet/file ids in GETFILEDATA/GETDIRFILES with different
+/// radices: the spec mandates hex, but several Chinese clients (飞鸽/飞秋等)
+/// use decimal. Resolve against the file table instead of trusting one radix.
+fn lookup_file_entry(
+    table: &HashMap<(u32, u32), FileEntry>,
+    pkt_no: &str,
+    file_id: &str,
+) -> Option<(u32, u32, FileEntry)> {
+    let mut candidates: Vec<Vec<u32>> = Vec::with_capacity(2);
+    for s in [pkt_no, file_id] {
+        let s = s.trim();
+        let mut vals: Vec<u32> = Vec::new();
+        if let Ok(v) = u32::from_str_radix(s, 16) {
+            vals.push(v);
+        }
+        if let Ok(v) = s.parse::<u32>()
+            && !vals.contains(&v)
+        {
+            vals.push(v);
+        }
+        let auto = parse_u32_auto_radix(s);
+        if !vals.contains(&auto) {
+            vals.push(auto);
+        }
+        candidates.push(vals);
+    }
+    for a in &candidates[0] {
+        for b in &candidates[1] {
+            if let Some(entry) = table.get(&(*a, *b)) {
+                return Some((*a, *b, entry.clone()));
+            }
+        }
+    }
+    None
 }
 
 fn detect_net() -> Option<(String, Ipv4Addr)> {
@@ -814,1038 +1770,6 @@ fn is_virtual_name(name: &str) -> bool {
         || n.contains("virtual")
         || n.contains("hyper-v")
         || n.contains("hyperv")
-}
-
-pub async fn send_broadcast_entry() -> Result<()> {
-    let socket = {
-        MAIN_SOCKET.lock().unwrap().as_ref().cloned()
-    };
-    if let Some(socket) = socket {
-        let (username, hostname) = {
-            let info = USER_INFO.read().unwrap();
-            (info.username.clone(), info.hostname.clone())
-        };
-        let extra = build_user_extra();
-        let packet = Packet {
-            version: VER,
-            packet_no: now_millis(),
-            username,
-            hostname,
-            command: IPMSG_BR_ENTRY,
-            extra,
-        };
-        let addr = broadcast_target();
-        socket.send_to(&packet.encode(), addr).await?;
-        info!("BR_ENTRY sent id={} to {}", packet.packet_no, addr);
-    }
-    Ok(())
-}
-
-pub async fn send_exit() -> Result<()> {
-    let socket = {
-        MAIN_SOCKET.lock().unwrap().as_ref().cloned()
-    };
-    let socket = if let Some(s) = socket {
-        s
-    } else {
-        let raw = UdpSocket::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            PORT,
-        ))
-        .await?;
-        raw.set_broadcast(true)?;
-        Arc::new(raw)
-    };
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let extra = build_user_extra();
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_BR_EXIT,
-        extra,
-    };
-    let addr = broadcast_target();
-    socket.send_to(&packet.encode(), addr).await?;
-    info!("BR_EXIT sent id={} to {}", packet.packet_no, addr);
-    Ok(())
-}
-
-pub async fn send_exit_to(to: SocketAddr) -> Result<()> {
-    let socket = {
-        MAIN_SOCKET.lock().unwrap().as_ref().cloned()
-    };
-    let socket = if let Some(s) = socket {
-        s
-    } else {
-        let raw = UdpSocket::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            PORT,
-        ))
-        .await?;
-        raw.set_broadcast(true)?;
-        Arc::new(raw)
-    };
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let extra = build_user_extra();
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_BR_EXIT,
-        extra,
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    info!("BR_EXIT sent id={} to {}", packet.packet_no, to);
-    Ok(())
-}
-
-/// Send a text message; returns the packet_no used, which the peer echoes
-/// back in RECVMSG so the caller can track delivery status.
-pub async fn send_message(to: SocketAddr, text: String) -> Result<u32> {
-    let socket = {
-        MAIN_SOCKET.lock().unwrap().as_ref().cloned()
-    };
-    let socket = if let Some(s) = socket {
-        s
-    } else {
-        let raw = UdpSocket::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            PORT,
-        ))
-        .await?;
-        raw.set_broadcast(true)?;
-        Arc::new(raw)
-    };
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT,
-        extra: text,
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    info!(
-        "SENDMSG sent id={} to {} text='{}'",
-        packet.packet_no, to, packet.extra
-    );
-    Ok(packet.packet_no)
-}
-
-pub async fn send_file(to: SocketAddr, path: String) -> Result<()> {
-    let socket = {
-        MAIN_SOCKET.lock().unwrap().as_ref().cloned()
-    };
-    let socket = if let Some(s) = socket {
-        s
-    } else {
-        let raw = UdpSocket::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            PORT,
-        ))
-        .await?;
-        raw.set_broadcast(true)?;
-        Arc::new(raw)
-    };
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let meta = fs::metadata(&path).await?;
-    let file_size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let file_name = PathBuf::from(&path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file")
-        .replace(':', "::");
-    let file_id = loop {
-        let id = random_file_id();
-        if id != 0 {
-            break id;
-        }
-    };
-    let packet_no = now_millis();
-    {
-        let mut table = FILE_TABLE.lock().unwrap();
-        if table.contains_key(&(packet_no, file_id)) {
-            return Err(anyhow!("file id collision, retry transfer"));
-        }
-        table.insert(
-            (packet_no, file_id),
-            FileEntry {
-                to: to.ip(),
-                path: PathBuf::from(&path),
-                size: file_size,
-                is_dir: false,
-            },
-        );
-    }
-    let size_hex = format!("{:x}", file_size);
-    let mtime_hex = format!("{:x}", mtime);
-    let attr_hex = format!("{:x}", IPMSG_FILE_REGULAR);
-    // Per spec, only size/mtime/fileattr are hex; fileID is decimal
-    // (protocol.txt §5, draft 14).
-    let file_info = format!(
-        "{}:{}:{}:{}:{}:\x07",
-        file_id, file_name, size_hex, mtime_hex, attr_hex
-    );
-    let mut extra = String::new();
-    extra.push_str("");
-    extra.push('\0');
-    extra.push_str(&file_info);
-    let packet = Packet {
-        version: VER,
-        packet_no,
-        username,
-        hostname,
-        command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_FILEATTACHOPT,
-        extra,
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    info!(
-        "SENDMSG(FILE) sent id={} to {} file='{}' size={}",
-        packet.packet_no, to, path, file_size
-    );
-    Ok(())
-}
-
-pub async fn send_files(to: SocketAddr, paths: Vec<String>) -> Result<Vec<SentFileMeta>> {
-    let socket = {
-        MAIN_SOCKET.lock().unwrap().as_ref().cloned()
-    };
-    let socket = if let Some(s) = socket {
-        s
-    } else {
-        let raw = UdpSocket::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            PORT,
-        ))
-        .await?;
-        raw.set_broadcast(true)?;
-        Arc::new(raw)
-    };
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-
-    let mut valid_files = Vec::new();
-    for path in paths {
-         if let Ok(meta) = fs::metadata(&path).await {
-             if meta.is_file() {
-                 valid_files.push((path, meta));
-             }
-         }
-    }
-    
-    if valid_files.is_empty() {
-        return Err(anyhow!("No valid files to send"));
-    }
-
-    let packet_no = now_millis();
-    let mut file_infos = String::new();
-    let mut sent_items = Vec::new();
-
-    {
-        let mut table = FILE_TABLE.lock().unwrap();
-        for (path, meta) in valid_files.iter() {
-            let file_size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let file_name = PathBuf::from(path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file")
-                .replace(':', "::");
-
-            let file_id = loop {
-                let id = random_file_id();
-                if id != 0 && !table.contains_key(&(packet_no, id)) {
-                    break id;
-                }
-            };
-
-            table.insert(
-                (packet_no, file_id),
-                FileEntry {
-                    to: to.ip(),
-                    path: PathBuf::from(path),
-                    size: file_size,
-                    is_dir: false,
-                },
-            );
-            sent_items.push(SentFileMeta {
-                packet_no,
-                file_id,
-                path: path.clone(),
-                name: file_name.clone(),
-                size: file_size,
-                is_dir: false,
-            });
-
-            let size_hex = format!("{:x}", file_size);
-            let mtime_hex = format!("{:x}", mtime);
-            let attr_hex = format!("{:x}", IPMSG_FILE_REGULAR);
-            let info = format!(
-                "{}:{}:{}:{}:{}:\x07",
-                file_id, file_name, size_hex, mtime_hex, attr_hex
-            );
-            file_infos.push_str(&info);
-        }
-    }
-
-    let mut extra = String::new();
-    extra.push_str("");
-    extra.push('\0');
-    extra.push_str(&file_infos);
-
-    let packet = Packet {
-        version: VER,
-        packet_no,
-        username,
-        hostname,
-        command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_FILEATTACHOPT,
-        extra,
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    info!(
-        "SENDMSG(FILES) sent id={} to {} count={}",
-        packet.packet_no, to, valid_files.len()
-    );
-    Ok(sent_items)
-}
-
-pub async fn send_folder(to: SocketAddr, dir: String) -> Result<SentFileMeta> {
-    let socket = {
-        MAIN_SOCKET.lock().unwrap().as_ref().cloned()
-    };
-    let socket = if let Some(s) = socket {
-        s
-    } else {
-        let raw = UdpSocket::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            PORT,
-        ))
-        .await?;
-        raw.set_broadcast(true)?;
-        Arc::new(raw)
-    };
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let meta = fs::metadata(&dir).await?;
-    if !meta.is_dir() {
-        return Err(anyhow!("send_folder path is not directory"));
-    }
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let dir_name = PathBuf::from(&dir)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("dir")
-        .replace(':', "::");
-    let file_id = loop {
-        let id = random_file_id();
-        if id != 0 {
-            break id;
-        }
-    };
-    let packet_no = now_millis();
-    {
-        let mut table = FILE_TABLE.lock().unwrap();
-        if table.contains_key(&(packet_no, file_id)) {
-            return Err(anyhow!("file id collision, retry transfer"));
-        }
-        table.insert(
-            (packet_no, file_id),
-            FileEntry {
-                to: to.ip(),
-                path: PathBuf::from(&dir),
-                size: 0,
-                is_dir: true,
-            },
-        );
-    }
-    let size_hex = format!("{:x}", 0u64);
-    let mtime_hex = format!("{:x}", mtime);
-    let attr_hex = format!("{:x}", IPMSG_FILE_DIR);
-    let file_info = format!(
-        "{}:{}:{}:{}:{}:\x07",
-        file_id, dir_name, size_hex, mtime_hex, attr_hex
-    );
-    let text = format!("[文件夹] {}", dir_name);
-    let mut extra = String::new();
-    extra.push_str(&text);
-    extra.push('\0');
-    extra.push_str(&file_info);
-    let packet = Packet {
-        version: VER,
-        packet_no,
-        username,
-        hostname,
-        command: IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_FILEATTACHOPT,
-        extra,
-    };
-    socket.send_to(&packet.encode(), to).await?;
-    info!(
-        "SENDMSG(DIR) sent id={} to {} dir='{}'",
-        packet.packet_no, to, dir
-    );
-    Ok(SentFileMeta {
-        packet_no,
-        file_id,
-        path: dir,
-        name: dir_name,
-        size: 0,
-        is_dir: true,
-    })
-}
-
-async fn recv_file_once<F>(
-    from: SocketAddr,
-    packet_no: u32,
-    file_id: u32,
-    save_path: &str,
-    use_hex: bool,
-    expected_size: u64,
-    on_progress: &mut F,
-) -> Result<u64>
-where
-    F: FnMut(u64),
-{
-    let mut stream = TcpStream::connect(from).await?;
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    let extra = if use_hex {
-        format!("{:x}:{:x}:0", packet_no, file_id)
-    } else {
-        format!("{}:{}:0", packet_no, file_id)
-    };
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_GETFILEDATA,
-        extra,
-    };
-    let buf = packet.encode();
-    stream.write_all(&buf).await?;
-    let mut file = fs::File::create(save_path).await?;
-    let mut buf = [0u8; 8192];
-    let mut total: u64 = 0;
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n]).await?;
-        total += n as u64;
-        on_progress(total);
-        if expected_size > 0 && total >= expected_size {
-            break;
-        }
-    }
-    info!(
-        "RECVFILE attempt mode={} from {} packet_no={} (0x{:x}) file_id={} (0x{:x}) size={} path='{}'",
-        if use_hex { "hex" } else { "dec" },
-        from,
-        packet_no,
-        packet_no,
-        file_id,
-        file_id,
-        total,
-        save_path
-    );
-    if expected_size > 0 && total < expected_size {
-        return Err(anyhow!(
-            "incomplete file transfer: expected {} bytes, got {}",
-            expected_size,
-            total
-        ));
-    }
-    Ok(total)
-}
-
-pub async fn recv_file<F>(
-    from: SocketAddr,
-    packet_no: u32,
-    file_id: u32,
-    expected_size: u64,
-    save_path: String,
-    mut on_progress: F,
-) -> Result<()>
-where
-    F: FnMut(u64) + Send,
-{
-    info!("recv_file start from {} packet_no={} file_id={}", from, packet_no, file_id);
-    let first_try = recv_file_once(
-        from,
-        packet_no,
-        file_id,
-        &save_path,
-        true, // use hex
-        expected_size,
-        &mut on_progress,
-    )
-    .await;
-    if first_try.is_err() {
-        info!(
-            "recv_file retry with decimal mode from {} packet_no={} file_id={}",
-            from, packet_no, file_id
-        );
-        recv_file_once(
-            from,
-            packet_no,
-            file_id,
-            &save_path,
-            false, // retry with decimal
-            expected_size,
-            &mut on_progress,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-pub async fn recv_folder<F>(
-    from: SocketAddr,
-    packet_no: u32,
-    file_id: u32,
-    save_path: String,
-    mut on_progress: F,
-) -> Result<()>
-where
-    F: FnMut(u64, String) + Send,
-{
-    info!("recv_folder start from {} packet_no={} file_id={}", from, packet_no, file_id);
-    let mut stream = TcpStream::connect(from).await?;
-    let (username, hostname) = {
-        let info = USER_INFO.read().unwrap();
-        (info.username.clone(), info.hostname.clone())
-    };
-    // For folder, extra format is packet_no:file_id:0 (same as file?)
-    // Actually spec says just packet_no:file_id. The 3rd field is offset, usually 0.
-    let extra = format!("{:x}:{:x}:0", packet_no, file_id);
-    
-    let packet = Packet {
-        version: VER,
-        packet_no: now_millis(),
-        username,
-        hostname,
-        command: IPMSG_GETDIRFILES,
-        extra,
-    };
-    let buf = packet.encode();
-    stream.write_all(&buf).await?;
-
-    let mut path_stack = vec![PathBuf::from(&save_path)];
-    // Ensure the root save_path exists (it should be created by the caller? No, we are creating the folder structure inside it? 
-    // Wait, save_path INCLUDES the folder name. So we should create it.
-    if !std::path::Path::new(&save_path).exists() {
-        fs::create_dir_all(&save_path).await?;
-    }
-
-    let mut total_received: u64 = 0;
-    let mut reader = tokio::io::BufReader::new(stream);
-    let mut is_first_entry = true;
-
-    loop {
-        // Read header size (hex string until ':')
-        let mut size_buf = Vec::new();
-        loop {
-            let mut b = [0u8; 1];
-            let n = reader.read(&mut b).await?;
-            if n == 0 {
-                // End of stream. If no entry was received, treat it as canceled/unavailable.
-                if is_first_entry {
-                    return Err(anyhow!("no folder data received"));
-                }
-                return Ok(());
-            }
-            if b[0] == b':' {
-                break;
-            }
-            size_buf.push(b[0]);
-            if size_buf.len() > 10 { // Safety limit
-                 return Err(anyhow!("Header size too long"));
-            }
-        }
-
-        let size_str = String::from_utf8_lossy(&size_buf);
-        let header_len = u32::from_str_radix(&size_str, 16)?;
-        
-        // 2. Read the rest of the header
-        // We already read size_buf.len() + 1 bytes
-        let remaining_header_len = header_len as usize - size_buf.len() - 1;
-        let mut header_buf = vec![0u8; remaining_header_len];
-        reader.read_exact(&mut header_buf).await?;
-        
-        // Parse header: filename:size:type:attrs...
-        // Decode header string (GB18030 usually)
-        let header_str = decode_text(&header_buf);
-        let parts: Vec<&str> = header_str.split(':').collect();
-        
-        if parts.len() < 3 {
-             return Err(anyhow!("Invalid folder header"));
-        }
-        
-        // Handle potential leading colon (which results in empty first part)
-        let (filename, file_size_str, file_type_str) = if parts[0].is_empty() && parts.len() >= 4 {
-             (parts[1], parts[2], parts[3])
-        } else if !parts[0].is_empty() && parts.len() >= 3 {
-             (parts[0], parts[1], parts[2])
-        } else {
-             return Err(anyhow!("Invalid folder header: {:?}", header_str));
-        };
-        
-        let file_size = u64::from_str_radix(file_size_str, 16).map_err(|e| anyhow!("Invalid file size: {} ({})", file_size_str, e))?;
-        let file_type = u32::from_str_radix(file_type_str, 16).map_err(|e| anyhow!("Invalid file type: {} ({})", file_type_str, e))?;
-        
-        let current_is_first = is_first_entry;
-        is_first_entry = false;
-
-        match file_type {
-            IPMSG_FILE_REGULAR => {
-                let Some(filename) = sanitize_wire_filename(filename) else {
-                    return Err(anyhow!(
-                        "refused unsafe filename in folder transfer: {:?}",
-                        header_str
-                    ));
-                };
-                if let Some(current_dir) = path_stack.last() {
-                    let file_path = current_dir.join(filename);
-                    let mut file = fs::File::create(&file_path).await?;
-                    // Notify UI immediately when a new file header is parsed,
-                    // so filename switches without waiting for first data chunk.
-                    on_progress(total_received, filename.to_string());
-                    
-                    // Read file content
-                    let mut received = 0u64;
-                    let mut buf = [0u8; 8192];
-                    while received < file_size {
-                        let to_read = std::cmp::min(buf.len() as u64, file_size - received) as usize;
-                        let n = reader.read(&mut buf[..to_read]).await?;
-                        if n == 0 {
-                            return Err(anyhow!("Unexpected EOF during file content"));
-                        }
-                        file.write_all(&buf[..n]).await?;
-                        received += n as u64;
-                        total_received += n as u64;
-                        on_progress(total_received, filename.to_string());
-                    }
-                }
-            }
-            IPMSG_FILE_DIR => {
-                if current_is_first {
-                    // IPMSG protocol sends the root directory header first.
-                    // Since 'save_path' already includes the folder name (e.g. .../Downloads/FolderName),
-                    // we treat this first header as the root directory itself, not a subdirectory.
-                    // We simply skip creating a new directory level to avoid double nesting (FolderName/FolderName).
-                    // This effectively maps the sender's root folder name to our local 'save_path'.
-                    continue;
-                }
-                let Some(filename) = sanitize_wire_filename(filename) else {
-                    return Err(anyhow!(
-                        "refused unsafe directory name in folder transfer: {:?}",
-                        header_str
-                    ));
-                };
-                if let Some(current_dir) = path_stack.last() {
-                    let dir_path = current_dir.join(filename);
-                    if !dir_path.exists() {
-                        fs::create_dir(&dir_path).await?;
-                    }
-                    path_stack.push(dir_path);
-                }
-            }
-            IPMSG_FILE_RETPARENT => {
-                if filename == "." {
-                   // Some clients send "." for RETPARENT?
-                   // Just pop
-                }
-                path_stack.pop();
-            }
-            _ => {
-                // Ignore other types or handle if needed
-                // If it has content size, we must skip it
-                if file_size > 0 {
-                    let mut skipped = 0u64;
-                    let mut buf = [0u8; 8192];
-                    while skipped < file_size {
-                        let to_read = std::cmp::min(buf.len() as u64, file_size - skipped) as usize;
-                        let n = reader.read(&mut buf[..to_read]).await?;
-                        if n == 0 { break; }
-                        skipped += n as u64;
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn write_dir_header(
-    stream: &mut TcpStream,
-    filename: &str,
-    file_attr: u32,
-    file_size: u64,
-    mtime: u64,
-) -> Result<()> {
-    let ts = if mtime == 0 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    } else {
-        mtime
-    };
-    let mut header = String::new();
-    header.push(':');
-    header.push_str(filename);
-    header.push(':');
-    header.push_str(&format!("{:x}", file_size));
-    header.push(':');
-    header.push_str(&format!("{:x}", file_attr));
-    header.push(':');
-    header.push_str(&format!("{:x}={:x}", IPMSG_FILE_CREATETIME, ts));
-    header.push(':');
-    header.push_str(&format!("{:x}={:x}", IPMSG_FILE_MTIME, ts));
-    header.push(':');
-    let header_bytes = encode_text(&header);
-    let header_len = header_bytes.len();
-    let total_len = header_len + 4;
-    let len_hex = format!("{:0>4x}", total_len);
-    let mut out = len_hex.into_bytes();
-    out.extend_from_slice(&header_bytes);
-    stream.write_all(&out).await?;
-    Ok(())
-}
-
-fn send_dir_children<'a>(
-    stream: &'a mut TcpStream,
-    dir: PathBuf,
-    cancel_token: Arc<AtomicBool>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let mut entries = fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if cancel_token.load(Ordering::SeqCst) {
-                return Err(anyhow!("send canceled"));
-            }
-            let path = entry.path();
-            let meta = entry.metadata().await?;
-            if meta.is_dir() {
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("dir");
-                write_dir_header(stream, name, IPMSG_FILE_DIR, 0, mtime).await?;
-                send_dir_children(stream, path.clone(), cancel_token.clone()).await?;
-                write_dir_header(stream, ".", IPMSG_FILE_RETPARENT, 0, 0).await?;
-            } else if meta.is_file() {
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("file");
-                // Never emit entries whose name we would refuse on the receive
-                // side (e.g. NTFS alternate data streams like "f.txt:ads").
-                if sanitize_wire_filename(name).is_none() {
-                    warn!("skip sending entry with unsafe name: {:?}", path);
-                    continue;
-                }
-                let size = meta.len();
-                write_dir_header(stream, name, IPMSG_FILE_REGULAR, size, mtime).await?;
-                let mut file = fs::File::open(&path).await?;
-                let mut buf = [0u8; 8192];
-                let mut sent: u64 = 0;
-                loop {
-                    if cancel_token.load(Ordering::SeqCst) {
-                        return Err(anyhow!("send canceled"));
-                    }
-                    let n = file.read(&mut buf).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    stream.write_all(&buf[..n]).await?;
-                    sent += n as u64;
-                    if sent >= size {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    })
-}
-
-async fn send_dir_hierarchy(
-    stream: &mut TcpStream,
-    root: &PathBuf,
-    cancel_token: Arc<AtomicBool>,
-) -> Result<()> {
-    if cancel_token.load(Ordering::SeqCst) {
-        return Err(anyhow!("send canceled"));
-    }
-    let root_name = root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("dir");
-    let meta = fs::metadata(root).await?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    write_dir_header(stream, root_name, IPMSG_FILE_DIR, 0, mtime).await?;
-    send_dir_children(stream, root.clone(), cancel_token.clone()).await?;
-    write_dir_header(stream, ".", IPMSG_FILE_RETPARENT, 0, 0).await?;
-    Ok(())
-}
-
-/// Peers echo packet/file ids in GETFILEDATA/GETDIRFILES with different
-/// radices: the spec mandates hex, but several Chinese clients (飞鸽/飞秋等)
-/// use decimal. Resolve against the file table instead of trusting one radix.
-fn lookup_file_entry(
-    table: &HashMap<(u32, u32), FileEntry>,
-    pkt_no: &str,
-    file_id: &str,
-) -> Option<(u32, u32, FileEntry)> {
-    let mut candidates: Vec<Vec<u32>> = Vec::with_capacity(2);
-    for s in [pkt_no, file_id] {
-        let s = s.trim();
-        let mut vals: Vec<u32> = Vec::new();
-        if let Ok(v) = u32::from_str_radix(s, 16) {
-            vals.push(v);
-        }
-        if let Ok(v) = s.parse::<u32>()
-            && !vals.contains(&v)
-        {
-            vals.push(v);
-        }
-        let auto = parse_u32_auto_radix(s);
-        if !vals.contains(&auto) {
-            vals.push(auto);
-        }
-        candidates.push(vals);
-    }
-    for a in &candidates[0] {
-        for b in &candidates[1] {
-            if let Some(entry) = table.get(&(*a, *b)) {
-                return Some((*a, *b, entry.clone()));
-            }
-        }
-    }
-    None
-}
-
-async fn handle_tcp_file(
-    mut stream: TcpStream,
-    peer_addr: SocketAddr,
-    tx: broadcast::Sender<Event>,
-) -> Result<()> {
-    info!("handle_tcp_file");
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let header = &buf[..n];
-    let packet = parse_packet(header)?;
-    let base = packet.command & 0x000000ff;
-    if base == IPMSG_GETFILEDATA {
-        let parts: Vec<&str> = packet.extra.split(':').collect();
-        if parts.len() < 3 {
-            return Err(anyhow!("bad GETFILEDATA extra"));
-        }
-        let (pkt_no, file_id, entry) = {
-            let table = FILE_TABLE.lock().unwrap();
-            info!("handle_tcp_file table={:?}", table);
-            match lookup_file_entry(&table, parts[0], parts[1]) {
-                Some((p, f, e)) => (p, f, Some(e)),
-                None => (0, 0, None),
-            }
-        };
-        let offset = parse_u64_auto_radix(parts[2].trim());
-        info!("handle_tcp_file packet_no={:x} file_id={:x} offset={:x} {:?}", pkt_no, file_id, offset, entry);
-        if let Some(entry) = entry {
-            // Only the peer the file was offered to may download it (P0-3).
-            // Compare by IP: the TCP client connects from an ephemeral port,
-            // so full socket equality never matches.
-            if entry.to != peer_addr.ip() {
-                warn!(
-                    "denied GETFILEDATA ({:x},{:x}) from {}: not intended recipient {:?}",
-                    pkt_no, file_id, peer_addr.ip(), entry.to
-                );
-                return Err(anyhow!("file request not authorized"));
-            }
-            if entry.is_dir {
-                return Ok(());
-            }
-            let cancel_token = send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-            if cancel_token.load(Ordering::SeqCst) {
-                clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-                return Err(anyhow!("send canceled"));
-            }
-            let _ = tx.send(Event::FileServingStarted {
-                to: peer_addr,
-                packet_no: pkt_no,
-                file_id,
-                is_dir: false,
-            });
-            let mut file = fs::File::open(&entry.path).await?;
-            if offset > 0 {
-                file.seek(std::io::SeekFrom::Start(offset)).await?;
-            }
-            let mut buf = [0u8; 8192];
-            let send_result: Result<()> = async {
-                loop {
-                    if cancel_token.load(Ordering::SeqCst) {
-                        return Err(anyhow!("send canceled"));
-                    }
-                    let n = file.read(&mut buf).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    stream.write_all(&buf[..n]).await?;
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(err) = send_result {
-                clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-                return Err(err);
-            }
-            info!(
-                "SENDFILE done packet_no={:x} file_id={:x} path='{}'",
-                pkt_no,
-                file_id,
-                entry.path.to_string_lossy()
-            );
-            let _ = tx.send(Event::FileServed {
-                to: peer_addr,
-                packet_no: pkt_no,
-                file_id,
-                is_dir: false,
-            });
-            clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-        }
-        return Ok(());
-    }
-    if base == IPMSG_GETDIRFILES {
-        let parts: Vec<&str> = packet.extra.split(':').collect();
-        if parts.len() < 2 {
-            return Err(anyhow!("bad GETDIRFILES extra"));
-        }
-        let (pkt_no, file_id, entry) = {
-            let table = FILE_TABLE.lock().unwrap();
-            match lookup_file_entry(&table, parts[0], parts[1]) {
-                Some((p, f, e)) => (p, f, Some(e)),
-                None => (0, 0, None),
-            }
-        };
-        let _offset = if parts.len() >= 3 {
-            parse_u64_auto_radix(parts[2].trim())
-        } else {
-            0
-        };
-        if let Some(entry) = entry {
-            // Only the peer the file was offered to may download it (P0-3).
-            if entry.to != peer_addr.ip() {
-                warn!(
-                    "denied GETDIRFILES ({:x},{:x}) from {}: not intended recipient {:?}",
-                    pkt_no, file_id, peer_addr.ip(), entry.to
-                );
-                return Err(anyhow!("file request not authorized"));
-            }
-            if entry.is_dir {
-                let cancel_token = send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-                if cancel_token.load(Ordering::SeqCst) {
-                    clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-                    return Err(anyhow!("send canceled"));
-                }
-                let _ = tx.send(Event::FileServingStarted {
-                    to: peer_addr,
-                    packet_no: pkt_no,
-                    file_id,
-                    is_dir: true,
-                });
-                let send_result =
-                    send_dir_hierarchy(&mut stream, &entry.path, cancel_token.clone()).await;
-                if let Err(err) = send_result {
-                    clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-                    return Err(err);
-                }
-                info!(
-                    "SENDDIR done packet_no={:x} file_id={:x} path='{}'",
-                    pkt_no,
-                    file_id,
-                    entry.path.to_string_lossy()
-                );
-                let _ = tx.send(Event::FileServed {
-                    to: peer_addr,
-                    packet_no: pkt_no,
-                    file_id,
-                    is_dir: true,
-                });
-                clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
-            }
-        }
-    }
-    Ok(())
-}
-
-
-pub async fn start_ipmsg() -> Result<(broadcast::Receiver<Event>, u16)> {
-    env_logger::try_init().ok();
-    let service = Service::new().await?;
-    let rx = service.events.subscribe();
-    let port = service.port;
-    service.spawn().await?;
-    Ok((rx, port))
 }
 
 #[cfg(test)]

@@ -1,18 +1,16 @@
 use crate::config;
-use crate::ipmsg_core::{
-    Event, TextEncoding, detect_self_addr, protocol::PORT, set_text_encoding, set_user_info,
-    start_ipmsg,
-};
-use once_cell::sync::{Lazy, OnceCell};
+use crate::ipmsg_core::{self, Event, TextEncoding, detect_self_addr, protocol::PORT};
+use gpui::Global;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OnlineUser {
@@ -168,43 +166,687 @@ pub enum StateDelta {
     SettingsChanged,
 }
 
-static STATE_DELTA: Lazy<(
-    mpsc::UnboundedSender<StateDelta>,
-    Mutex<Option<mpsc::UnboundedReceiver<StateDelta>>>,
-)> = Lazy::new(|| {
-    let (tx, rx) = mpsc::unbounded_channel();
-    (tx, Mutex::new(Some(rx)))
-});
-
-/// UI 侧取走 delta 接收端（只应调用一次；桥接任务与状态 actor 同生命周期）。
-/// 无论 UI 与 actor 谁先访问，通道都在同一处惰性创建，不存在竞态。
-pub fn take_delta_rx() -> Option<mpsc::UnboundedReceiver<StateDelta>> {
-    STATE_DELTA.1.lock().unwrap().take()
+/// 状态层唯一实例：持有命令/增量通道、快照、消息 id 序列与下载任务注册表
+/// （docs/architecture.md §4.2 中期项 1：全局静态收拢）。状态 actor 与协议
+/// pump 运行在 tokio 线程，经 `Arc` 共享；UI 主线程经 GPUI Global 注入。
+pub struct AppState {
+    cmd_tx: mpsc::Sender<StateCmd>,
+    cmd_rx: Mutex<Option<mpsc::Receiver<StateCmd>>>,
+    delta_tx: mpsc::UnboundedSender<StateDelta>,
+    delta_rx: Mutex<Option<mpsc::UnboundedReceiver<StateDelta>>>,
+    snapshot: Arc<Mutex<CoreState>>,
+    next_message_id: AtomicU64,
+    active_downloads: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
-fn emit_delta(delta: StateDelta) {
-    // 无界通道的 send 只在接收端被丢弃时失败；通道保序，UI 按序应用增量。
-    let _ = STATE_DELTA.0.send(delta);
+/// GPUI Global 包装：`Arc<AppState>` 是外部类型，按孤儿规则不能直接实现
+/// `Global`，因此套一层 newtype（GPUI Global 文档推荐做法）。
+#[derive(Clone)]
+pub struct AppStateGlobal(pub Arc<AppState>);
+
+impl Global for AppStateGlobal {}
+
+impl AppStateGlobal {
+    pub fn arc(&self) -> &Arc<AppState> {
+        &self.0
+    }
+}
+
+static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+
+pub fn set_instance(app_state: Arc<AppState>) {
+    let _ = APP_STATE.set(app_state);
+}
+
+/// The registered state instance. Panics if `set_instance` has not been called
+/// (i.e. before `logic::ensure_started` completes its synchronous part).
+pub fn app_state() -> &'static Arc<AppState> {
+    APP_STATE.get().expect("app state not initialized")
+}
+
+const ACKED_PACKETS_MAX: usize = 4096;
+
+/// 文本消息发出后等待对端 RECVMSG 确认的时限。局域网内正常应答在毫秒级；
+/// 超时即视为对端未收到（UDP send_to 对已关闭端口依然返回成功）。
+const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl AppState {
+    pub fn new() -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+        let (delta_tx, delta_rx) = mpsc::unbounded_channel();
+        Self {
+            cmd_tx,
+            cmd_rx: Mutex::new(Some(cmd_rx)),
+            delta_tx,
+            delta_rx: Mutex::new(Some(delta_rx)),
+            snapshot: Arc::new(Mutex::new(CoreState::new())),
+            next_message_id: AtomicU64::new(1),
+            active_downloads: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // ---- 对外命令入口 ----
+
+    /// 向状态 actor 派发一条命令（tokio 线程与 UI 主线程均可调用）。
+    pub fn dispatch(&self, cmd: StateCmd) {
+        if let Err(err) = self.cmd_tx.try_send(cmd) {
+            match err {
+                mpsc::error::TrySendError::Full(cmd) => {
+                    let tx = self.cmd_tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.blocking_send(cmd);
+                    });
+                }
+                mpsc::error::TrySendError::Closed(_) => {}
+            }
+        }
+    }
+
+    /// UI 侧取走 delta 接收端（只应调用一次；桥接任务与状态 actor 同生命周期）。
+    /// 无论 UI 与 actor 谁先访问，通道都在 `AppState::new` 一次性建好，不存在竞态。
+    pub fn take_delta_rx(&self) -> Option<mpsc::UnboundedReceiver<StateDelta>> {
+        self.delta_rx.lock().unwrap().take()
+    }
+
+    pub fn get_self_addr_info(&self) -> Option<OnlineUser> {
+        let state = self.snapshot.lock().unwrap();
+        if let Some(addr) = state.self_addr {
+            state.online_users.get(&addr).cloned()
+        } else {
+            None
+        }
+    }
+
+    // ---- 下载任务注册表（原 logic::ACTIVE_DOWNLOADS） ----
+
+    pub fn take_download(&self, key: &str) -> Option<JoinHandle<()>> {
+        self.active_downloads.lock().unwrap().remove(key)
+    }
+
+    pub fn insert_download(&self, key: String, handle: JoinHandle<()>) {
+        self.active_downloads.lock().unwrap().insert(key, handle);
+    }
+
+    // ---- 启动 ----
+
+    /// 在 tokio runtime 内启动状态 actor 与协议事件泵（原 `init_state`）。
+    /// `AppState` 与 `set_instance` 已在 `logic::ensure_started` 同步创建。
+    pub fn init(self: &Arc<Self>) {
+        let current_config = config::load_config();
+        rust_i18n::set_locale(current_config.ui_language.as_locale());
+        let self_name = current_config.user.username.clone();
+        let self_group = current_config.user.group.clone();
+        let self_host = hostname::get()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let language = current_config.language;
+
+        let me = Arc::clone(self);
+        tokio::spawn(async move { me.run_state_manager().await; });
+
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            me.pump_events(language, self_name, self_group, self_host)
+                .await;
+        });
+    }
+
+    async fn pump_events(
+        self: &Arc<Self>,
+        language: config::LanguageEncoding,
+        self_name: String,
+        self_group: String,
+        self_host: String,
+    ) {
+        let service = match ipmsg_core::start_ipmsg().await {
+            Ok(service) => service,
+            Err(e) => {
+                log::warn!("start_ipmsg failed: {}", e);
+                return;
+            }
+        };
+        service.set_text_encoding(match language {
+            config::LanguageEncoding::Utf8 => TextEncoding::Utf8,
+            config::LanguageEncoding::Gb18030 => TextEncoding::Gb18030,
+        });
+        service.set_user_info(&self_name, &self_group);
+        if let Err(e) = service.spawn().await {
+            log::warn!("ipmsg service spawn failed: {}", e);
+            return;
+        }
+        let port = service.port;
+        let self_addr = detect_self_addr(port)
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        let _ = self
+            .cmd_tx
+            .send(StateCmd::InitSelf {
+                user: self_name,
+                group: self_group,
+                host: self_host,
+                addr: self_addr,
+            })
+            .await;
+
+        // Lagged must NOT terminate the pump: it only means some events
+        // were dropped because we fell behind. Exiting the loop here would
+        // permanently silence all network events (P0-1 in docs/architecture.md).
+        let mut ipmsg_rx = service.events.subscribe();
+        loop {
+            match ipmsg_rx.recv().await {
+                Ok(ev) => {
+                    let _ = self.cmd_tx.send(StateCmd::ApplyEvent(ev)).await;
+                }
+                Err(RecvError::Lagged(missed)) => {
+                    log::warn!("ipmsg event pump lagged, {} events lost", missed);
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    }
+
+    fn next_message_id(&self) -> u64 {
+        self.next_message_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn emit_delta(&self, delta: StateDelta) {
+        // 无界通道的 send 只在接收端被丢弃时失败；通道保序，UI 按序应用增量。
+        let _ = self.delta_tx.send(delta);
+    }
+
+    /// 为一条等待确认的文本消息安装超时检查：到期仍未确认则派发 AckTimeout，
+    /// 由状态线程把气泡标记为失败（已确认的消息不受影响）。
+    fn arm_ack_timer(&self, packet_no: u32) {
+        let tx = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(ACK_TIMEOUT).await;
+            let _ = tx.send(StateCmd::AckTimeout { packet_no }).await;
+        });
+    }
+
+    /// 状态 actor 主循环：消费 `StateCmd`，维护 `CoreState` 快照并推送增量。
+    async fn run_state_manager(self: &Arc<Self>) {
+        let mut rx = self
+            .cmd_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("state actor already started");
+        let mut state = CoreState::new();
+        let history = history_path();
+        let legacy_history = legacy_history_path();
+        let history_content = if history.exists() {
+            fs::read_to_string(&history).ok()
+        } else {
+            fs::read_to_string(&legacy_history).ok()
+        };
+        if let Some(content) = history_content
+            && let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&content)
+        {
+            state.messages = msgs
+                .into_iter()
+                .map(|mut m| {
+                    if m.id == 0 {
+                        m.id = self.next_message_id();
+                    }
+                    m.from = normalize_addr(m.from);
+                    m.to = normalize_addr(m.to);
+                    m
+                })
+                .collect();
+            let _ = persist_history(&history, &state.messages);
+        }
+
+        // 初始全量同步：通道先缓冲、UI 后接入也能拿到完整历史（保序）。
+        self.emit_delta(StateDelta::Sync {
+            messages: state.messages.clone(),
+        });
+
+        while let Some(cmd) = rx.recv().await {
+            let mut changed = false;
+            let mut should_persist = false;
+            // 本条命令若恰好更新了一条消息，记录其克隆用于 MessageUpdated 增量。
+            let mut updated_message: Option<ChatMessage> = None;
+            match cmd {
+                StateCmd::InitSelf {
+                    user,
+                    group,
+                    host,
+                    addr,
+                } => {
+                    let addr_norm = normalize_addr(addr);
+                    state.self_addr = Some(addr_norm);
+                    state.self_name = user.clone();
+                    state.self_host = host.clone();
+                    state.online_users.insert(
+                        addr_norm,
+                        OnlineUser {
+                            name: user,
+                            group,
+                            host,
+                            addr: addr_norm,
+                        },
+                    );
+                    self.emit_delta(StateDelta::UsersChanged {
+                        users: sorted_users(&state),
+                    });
+                    changed = true;
+                    should_persist = true;
+                }
+                StateCmd::ApplyEvent(ev) => match ev {
+                    Event::Online {
+                        user,
+                        group,
+                        host,
+                        addr,
+                    } => {
+                        let addr_norm = normalize_addr(addr);
+                        // 回显报文头防御：username+host 都与本机一致时，说明对端
+                        // 回带了我们的报文头（或本机多网卡广播回环），不能据此
+                        // 建立对端条目，否则对端会话会显示成本机昵称。
+                        if Some(addr_norm) != state.self_addr
+                            && !packet_header_echoes_self(&state, &user, &host)
+                        {
+                            state.online_users.insert(
+                                addr_norm,
+                                OnlineUser {
+                                    name: user,
+                                    group,
+                                    host,
+                                    addr: addr_norm,
+                                },
+                            );
+                            self.emit_delta(StateDelta::UsersChanged {
+                                users: sorted_users(&state),
+                            });
+                            changed = true;
+                            should_persist = true;
+                        }
+                    }
+                    Event::Offline { addr, .. } => {
+                        let addr_norm = normalize_addr(addr);
+                        if state.online_users.remove(&addr_norm).is_some() {
+                            self.emit_delta(StateDelta::UsersChanged {
+                                users: sorted_users(&state),
+                            });
+                            changed = true;
+                            should_persist = true;
+                        }
+                    }
+                    Event::Message {
+                        from,
+                        user,
+                        host,
+                        text,
+                    } => {
+                        let from_norm = normalize_addr(from);
+                        let to = state.self_addr.unwrap_or_else(default_self_addr);
+                        let msg = ChatMessage {
+                            from: from_norm,
+                            to,
+                            is_me: false,
+                            text,
+                            time: t!("time.now").to_string(),
+                            file: None,
+                            failed: false,
+                            packet_no: 0,
+                            delivered: false,
+                            id: self.next_message_id(),
+                        };
+                        state.messages.push(msg.clone());
+                        self.emit_delta(StateDelta::MessageAdded { message: msg });
+                        // 对端回带本机报文头时，报文里的 user/host 不可信，
+                        // 不要据此建立对端条目（会话列表将回退显示地址）。
+                        if !packet_header_echoes_self(&state, &user, &host)
+                            && !state.online_users.contains_key(&from_norm)
+                        {
+                            state.online_users.insert(
+                                from_norm,
+                                OnlineUser {
+                                    name: user,
+                                    group: String::new(),
+                                    host,
+                                    addr: from_norm,
+                                },
+                            );
+                            self.emit_delta(StateDelta::UsersChanged {
+                                users: sorted_users(&state),
+                            });
+                        }
+                        let unread = {
+                            let entry = state.unread_counts.entry(from_norm).or_insert(0);
+                            *entry += 1;
+                            *entry
+                        };
+                        self.emit_delta(StateDelta::UnreadChanged {
+                            addr: from_norm,
+                            unread,
+                        });
+                        changed = true;
+                        should_persist = true;
+                    }
+                    Event::FileOffer {
+                        from,
+                        user,
+                        host,
+                        packet_no,
+                        file_id,
+                        name,
+                        size,
+                        is_dir,
+                    } => {
+                        let from_norm = normalize_addr(from);
+                        let to = state.self_addr.unwrap_or_else(default_self_addr);
+                        let text = if is_dir {
+                            t!("file.folder_prefix", name = name.clone()).to_string()
+                        } else {
+                            t!("file.file_with_size", name = name.clone(), size = format_size(size)).to_string()
+                        };
+                        let msg = ChatMessage {
+                            from: from_norm,
+                            to,
+                            is_me: false,
+                            text,
+                            time: t!("time.now").to_string(),
+                            file: Some(FileInfo {
+                                packet_no,
+                                file_id,
+                                name,
+                                size,
+                                saved: false,
+                                received: 0,
+                                is_dir,
+                                local_path: None,
+                                current_file: None,
+                                error: false,
+                                canceled: false,
+                                sending: false,
+                            }),
+                            failed: false,
+                            packet_no: 0,
+                            delivered: false,
+                            id: self.next_message_id(),
+                        };
+                        state.messages.push(msg.clone());
+                        self.emit_delta(StateDelta::MessageAdded { message: msg });
+                        // 同 Event::Message：回带本机报文头时不建立对端条目。
+                        if !packet_header_echoes_self(&state, &user, &host)
+                            && !state.online_users.contains_key(&from_norm)
+                        {
+                            state.online_users.insert(
+                                from_norm,
+                                OnlineUser {
+                                    name: user,
+                                    group: String::new(),
+                                    host,
+                                    addr: from_norm,
+                                },
+                            );
+                            self.emit_delta(StateDelta::UsersChanged {
+                                users: sorted_users(&state),
+                            });
+                        }
+                        let unread = {
+                            let entry = state.unread_counts.entry(from_norm).or_insert(0);
+                            *entry += 1;
+                            *entry
+                        };
+                        self.emit_delta(StateDelta::UnreadChanged {
+                            addr: from_norm,
+                            unread,
+                        });
+                        changed = true;
+                        should_persist = true;
+                    }
+                    Event::FileServed {
+                        to,
+                        packet_no,
+                        file_id,
+                        ..
+                    } => {
+                        let to_norm = normalize_addr(to);
+                        for message in state.messages.iter_mut().rev() {
+                            if !message.is_me || normalize_addr(message.to) != to_norm {
+                                continue;
+                            }
+                            if let Some(file) = &mut message.file
+                                && file.packet_no == packet_no
+                                && file.file_id == file_id
+                            {
+                                file.sending = false;
+                                file.saved = true;
+                                file.error = false;
+                                file.canceled = false;
+                                file.received = file.size;
+                                changed = true;
+                                should_persist = true;
+                                updated_message = Some(message.clone());
+                                break;
+                            }
+                        }
+                    }
+                    Event::FileServingStarted {
+                        to,
+                        packet_no,
+                        file_id,
+                        ..
+                    } => {
+                        let to_norm = normalize_addr(to);
+                        for message in state.messages.iter_mut().rev() {
+                            if !message.is_me || normalize_addr(message.to) != to_norm {
+                                continue;
+                            }
+                            if let Some(file) = &mut message.file
+                                && file.packet_no == packet_no
+                                && file.file_id == file_id
+                            {
+                                file.sending = true;
+                                file.saved = false;
+                                file.error = false;
+                                file.canceled = false;
+                                changed = true;
+                                should_persist = true;
+                                updated_message = Some(message.clone());
+                                break;
+                            }
+                        }
+                    }
+                    Event::Delivered { from, packet_no } => {
+                        // Peer's RECVMSG: delivery confirmation for an outgoing
+                        // message/file offer with the given packet_no.
+                        if packet_no != 0 {
+                            if state.acked_packets.len() >= ACKED_PACKETS_MAX {
+                                state.acked_packets.clear();
+                            }
+                            state.acked_packets.insert(packet_no);
+                        }
+                        let from_norm = normalize_addr(from);
+                        for message in state.messages.iter_mut().rev() {
+                            if !message.is_me || normalize_addr(message.to) != from_norm {
+                                continue;
+                            }
+                            let matches = message.packet_no == packet_no
+                                || message
+                                    .file
+                                    .as_ref()
+                                    .map(|f| f.packet_no == packet_no)
+                                    .unwrap_or(false);
+                            if matches {
+                                message.delivered = true;
+                                // 确认迟到（晚于 ACK_TIMEOUT 标记失败）时恢复气泡状态。
+                                message.failed = false;
+                                changed = true;
+                                should_persist = true;
+                                updated_message = Some(message.clone());
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                StateCmd::PushOutgoing(mut msg) => {
+                    if msg.id == 0 {
+                        msg.id = self.next_message_id();
+                    }
+                    // Race guard: the peer's RECVMSG can be processed by the event
+                    // pump before this task dispatches PushOutgoing, in which case
+                    // the ack was recorded in acked_packets with no message to
+                    // attach it to yet.
+                    if msg.packet_no != 0 && state.acked_packets.contains(&msg.packet_no) {
+                        msg.delivered = true;
+                    }
+                    // 纯文本消息走 SENDCHECKOPT：超时未确认要标记失败并提供重试
+                    // （文件消息有自己的传输状态流，不在此列）。
+                    let watch_ack = msg.packet_no != 0 && !msg.delivered && msg.file.is_none();
+                    let watch_packet_no = msg.packet_no;
+                    state.messages.push(msg.clone());
+                    self.emit_delta(StateDelta::MessageAdded { message: msg });
+                    changed = true;
+                    should_persist = true;
+                    if watch_ack {
+                        self.arm_ack_timer(watch_packet_no);
+                    }
+                }
+                StateCmd::AckTimeout { packet_no } => {
+                    for message in state.messages.iter_mut().rev() {
+                        if message.is_me
+                            && message.packet_no == packet_no
+                            && message.file.is_none()
+                        {
+                            if !message.delivered && !message.failed {
+                                message.failed = true;
+                                changed = true;
+                                should_persist = true;
+                                updated_message = Some(message.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+                StateCmd::UpdateProgress {
+                    from,
+                    file_id,
+                    packet_no,
+                    target_outgoing,
+                    progress,
+                    file_name,
+                    local_path,
+                    saved,
+                    error,
+                    canceled,
+                } => {
+                    let from_norm = normalize_addr(from);
+                    for message in state.messages.iter_mut().rev() {
+                        if let Some(target) = target_outgoing
+                            && message.is_me != target
+                        {
+                            continue;
+                        }
+                        if let Some(file) = &mut message.file {
+                            let matched_peer = if message.is_me {
+                                normalize_addr(message.to) == from_norm
+                            } else {
+                                message.from == from_norm
+                            };
+                            if matched_peer && file.packet_no == packet_no && file.file_id == file_id {
+                                file.received = progress;
+                                if let Some(name) = file_name {
+                                    file.current_file = Some(name);
+                                }
+                                if let Some(path) = local_path {
+                                    file.local_path = Some(path);
+                                }
+                                if let Some(is_saved) = saved {
+                                    file.saved = is_saved;
+                                }
+                                if let Some(has_error) = error {
+                                    file.error = has_error;
+                                }
+                                if let Some(is_canceled) = canceled {
+                                    file.canceled = is_canceled;
+                                }
+                                if saved.unwrap_or(false)
+                                    || error.unwrap_or(false)
+                                    || canceled.unwrap_or(false)
+                                {
+                                    should_persist = true;
+                                }
+                                changed = true;
+                                updated_message = Some(message.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+                StateCmd::ClearUnread { addr } => {
+                    let addr_norm = normalize_addr(addr);
+                    if state.unread_counts.remove(&addr_norm).is_some() {
+                        self.emit_delta(StateDelta::UnreadChanged {
+                            addr: addr_norm,
+                            unread: 0,
+                        });
+                        changed = true;
+                    }
+                }
+                StateCmd::RetryFinished {
+                    id,
+                    ok,
+                    packet_no,
+                    file_id,
+                } => {
+                    if !ok {
+                        continue;
+                    }
+                    for message in state.messages.iter_mut().rev() {
+                        if message.id == id {
+                            message.failed = false;
+                            message.delivered = false;
+                            message.packet_no = packet_no;
+                            if let Some(file) = &mut message.file {
+                                file.packet_no = packet_no;
+                                file.file_id = file_id;
+                            }
+                            // Same race guard as PushOutgoing: the peer may have
+                            // acked the retried packet before we got here.
+                            if packet_no != 0 && state.acked_packets.contains(&packet_no) {
+                                message.delivered = true;
+                            }
+                            changed = true;
+                            should_persist = true;
+                            updated_message = Some(message.clone());
+                            // 重发后同样要等待确认，超时再次标记失败。
+                            if packet_no != 0 && !message.delivered && message.file.is_none() {
+                                self.arm_ack_timer(packet_no);
+                            }
+                            break;
+                        }
+                    }
+                }
+                StateCmd::SettingsSaved => {
+                    self.emit_delta(StateDelta::SettingsChanged);
+                }
+            }
+
+            if let Some(message) = updated_message {
+                self.emit_delta(StateDelta::MessageUpdated { message });
+            }
+
+            if changed {
+                {
+                    let mut snap = self.snapshot.lock().unwrap();
+                    *snap = state.clone();
+                }
+                if should_persist {
+                    let _ = persist_history(&history, &state.messages);
+                }
+            }
+        }
+    }
 }
 
 fn sorted_users(state: &CoreState) -> Vec<OnlineUser> {
     let mut users: Vec<OnlineUser> = state.online_users.values().cloned().collect();
     users.sort_by_key(|u| u.addr);
     users
-}
-
-pub static STATE_SNAPSHOT: Lazy<Arc<Mutex<CoreState>>> =
-    Lazy::new(|| Arc::new(Mutex::new(CoreState::new())));
-static NEXT_MESSAGE_ID: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
-const ACKED_PACKETS_MAX: usize = 4096;
-static STATE_CMD_TX: OnceCell<mpsc::Sender<StateCmd>> = OnceCell::new();
-
-fn next_message_id() -> u64 {
-    NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-fn state_cmd_tx() -> &'static mpsc::Sender<StateCmd> {
-    STATE_CMD_TX.get().expect("STATE_CMD_TX not initialized")
 }
 
 fn history_path() -> PathBuf {
@@ -231,562 +873,6 @@ fn packet_header_echoes_self(state: &CoreState, user: &str, host: &str) -> bool 
         && user == state.self_name
         && !state.self_host.is_empty()
         && host == state.self_host
-}
-
-/// 文本消息发出后等待对端 RECVMSG 确认的时限。局域网内正常应答在毫秒级；
-/// 超时即视为对端未收到（UDP send_to 对已关闭端口依然返回成功）。
-const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// 为一条等待确认的文本消息安装超时检查：到期仍未确认则派发 AckTimeout，
-/// 由状态线程把气泡标记为失败（已确认的消息不受影响）。
-fn arm_ack_timer(packet_no: u32) {
-    let tx = state_cmd_tx().clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(ACK_TIMEOUT).await;
-        let _ = tx.send(StateCmd::AckTimeout { packet_no }).await;
-    });
-}
-
-pub async fn run_state_manager(mut rx: mpsc::Receiver<StateCmd>) {
-    let mut state = CoreState::new();
-    let history = history_path();
-    let legacy_history = legacy_history_path();
-    let history_content = if history.exists() {
-        fs::read_to_string(&history).ok()
-    } else {
-        fs::read_to_string(&legacy_history).ok()
-    };
-    if let Some(content) = history_content {
-        if let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&content) {
-            state.messages = msgs
-                .into_iter()
-                .map(|mut m| {
-                    if m.id == 0 {
-                        m.id = next_message_id();
-                    }
-                    m.from = normalize_addr(m.from);
-                    m.to = normalize_addr(m.to);
-                    m
-                })
-                .collect();
-            let _ = persist_history(&history, &state.messages);
-        }
-    }
-
-    // 初始全量同步：通道先缓冲、UI 后接入也能拿到完整历史（保序）。
-    emit_delta(StateDelta::Sync {
-        messages: state.messages.clone(),
-    });
-
-    while let Some(cmd) = rx.recv().await {
-        let mut changed = false;
-        let mut should_persist = false;
-        // 本条命令若恰好更新了一条消息，记录其克隆用于 MessageUpdated 增量。
-        let mut updated_message: Option<ChatMessage> = None;
-        match cmd {
-            StateCmd::InitSelf {
-                user,
-                group,
-                host,
-                addr,
-            } => {
-                let addr_norm = normalize_addr(addr);
-                state.self_addr = Some(addr_norm);
-                state.self_name = user.clone();
-                state.self_host = host.clone();
-                state.online_users.insert(
-                    addr_norm,
-                    OnlineUser {
-                        name: user,
-                        group,
-                        host,
-                        addr: addr_norm,
-                    },
-                );
-                emit_delta(StateDelta::UsersChanged {
-                    users: sorted_users(&state),
-                });
-                changed = true;
-                should_persist = true;
-            }
-            StateCmd::ApplyEvent(ev) => match ev {
-                Event::Online {
-                    user,
-                    group,
-                    host,
-                    addr,
-                } => {
-                    let addr_norm = normalize_addr(addr);
-                    // 回显报文头防御：username+host 都与本机一致时，说明对端
-                    // 回带了我们的报文头（或本机多网卡广播回环），不能据此
-                    // 建立对端条目，否则对端会话会显示成本机昵称。
-                    if Some(addr_norm) != state.self_addr
-                        && !packet_header_echoes_self(&state, &user, &host)
-                    {
-                        state.online_users.insert(
-                            addr_norm,
-                            OnlineUser {
-                                name: user,
-                                group,
-                                host,
-                                addr: addr_norm,
-                            },
-                        );
-                        emit_delta(StateDelta::UsersChanged {
-                            users: sorted_users(&state),
-                        });
-                        changed = true;
-                        should_persist = true;
-                    }
-                }
-                Event::Offline { addr, .. } => {
-                    let addr_norm = normalize_addr(addr);
-                    if state.online_users.remove(&addr_norm).is_some() {
-                        emit_delta(StateDelta::UsersChanged {
-                            users: sorted_users(&state),
-                        });
-                        changed = true;
-                        should_persist = true;
-                    }
-                }
-                Event::Message {
-                    from,
-                    user,
-                    host,
-                    text,
-                } => {
-                    let from_norm = normalize_addr(from);
-                    let to = state.self_addr.unwrap_or_else(default_self_addr);
-                    let msg = ChatMessage {
-                        from: from_norm,
-                        to,
-                        is_me: false,
-                        text,
-                        time: t!("time.now").to_string(),
-                        file: None,
-                        failed: false,
-                        packet_no: 0,
-                        delivered: false,
-                        id: next_message_id(),
-                    };
-                    state.messages.push(msg.clone());
-                    emit_delta(StateDelta::MessageAdded { message: msg });
-                    // 对端回带本机报文头时，报文里的 user/host 不可信，
-                    // 不要据此建立对端条目（会话列表将回退显示地址）。
-                    if !packet_header_echoes_self(&state, &user, &host)
-                        && !state.online_users.contains_key(&from_norm)
-                    {
-                        state.online_users.insert(
-                            from_norm,
-                            OnlineUser {
-                                name: user,
-                                group: String::new(),
-                                host,
-                                addr: from_norm,
-                            },
-                        );
-                        emit_delta(StateDelta::UsersChanged {
-                            users: sorted_users(&state),
-                        });
-                    }
-                    let unread = {
-                        let entry = state.unread_counts.entry(from_norm).or_insert(0);
-                        *entry += 1;
-                        *entry
-                    };
-                    emit_delta(StateDelta::UnreadChanged {
-                        addr: from_norm,
-                        unread,
-                    });
-                    changed = true;
-                    should_persist = true;
-                }
-                Event::FileOffer {
-                    from,
-                    user,
-                    host,
-                    packet_no,
-                    file_id,
-                    name,
-                    size,
-                    is_dir,
-                } => {
-                    let from_norm = normalize_addr(from);
-                    let to = state.self_addr.unwrap_or_else(default_self_addr);
-                    let text = if is_dir {
-                        t!("file.folder_prefix", name = name.clone()).to_string()
-                    } else {
-                        t!("file.file_with_size", name = name.clone(), size = format_size(size)).to_string()
-                    };
-                    let msg = ChatMessage {
-                        from: from_norm,
-                        to,
-                        is_me: false,
-                        text,
-                        time: t!("time.now").to_string(),
-                        file: Some(FileInfo {
-                            packet_no,
-                            file_id,
-                            name,
-                            size,
-                            saved: false,
-                            received: 0,
-                            is_dir,
-                            local_path: None,
-                            current_file: None,
-                            error: false,
-                            canceled: false,
-                            sending: false,
-                        }),
-                        failed: false,
-                        packet_no: 0,
-                        delivered: false,
-                        id: next_message_id(),
-                    };
-                    state.messages.push(msg.clone());
-                    emit_delta(StateDelta::MessageAdded { message: msg });
-                    // 同 Event::Message：回带本机报文头时不建立对端条目。
-                    if !packet_header_echoes_self(&state, &user, &host)
-                        && !state.online_users.contains_key(&from_norm)
-                    {
-                        state.online_users.insert(
-                            from_norm,
-                            OnlineUser {
-                                name: user,
-                                group: String::new(),
-                                host,
-                                addr: from_norm,
-                            },
-                        );
-                        emit_delta(StateDelta::UsersChanged {
-                            users: sorted_users(&state),
-                        });
-                    }
-                    let unread = {
-                        let entry = state.unread_counts.entry(from_norm).or_insert(0);
-                        *entry += 1;
-                        *entry
-                    };
-                    emit_delta(StateDelta::UnreadChanged {
-                        addr: from_norm,
-                        unread,
-                    });
-                    changed = true;
-                    should_persist = true;
-                }
-                Event::FileServed {
-                    to,
-                    packet_no,
-                    file_id,
-                    ..
-                } => {
-                    let to_norm = normalize_addr(to);
-                    for message in state.messages.iter_mut().rev() {
-                        if !message.is_me || normalize_addr(message.to) != to_norm {
-                            continue;
-                        }
-                        if let Some(file) = &mut message.file {
-                            if file.packet_no == packet_no && file.file_id == file_id {
-                                file.sending = false;
-                                file.saved = true;
-                                file.error = false;
-                                file.canceled = false;
-                                file.received = file.size;
-                                changed = true;
-                                should_persist = true;
-                                updated_message = Some(message.clone());
-                                break;
-                            }
-                        }
-                    }
-                }
-                Event::FileServingStarted {
-                    to,
-                    packet_no,
-                    file_id,
-                    ..
-                } => {
-                    let to_norm = normalize_addr(to);
-                    for message in state.messages.iter_mut().rev() {
-                        if !message.is_me || normalize_addr(message.to) != to_norm {
-                            continue;
-                        }
-                        if let Some(file) = &mut message.file {
-                            if file.packet_no == packet_no && file.file_id == file_id {
-                                file.sending = true;
-                                file.saved = false;
-                                file.error = false;
-                                file.canceled = false;
-                                changed = true;
-                                should_persist = true;
-                                updated_message = Some(message.clone());
-                                break;
-                            }
-                        }
-                    }
-                }
-                Event::Delivered { from, packet_no } => {
-                    // Peer's RECVMSG: delivery confirmation for an outgoing
-                    // message/file offer with the given packet_no.
-                    if packet_no != 0 {
-                        if state.acked_packets.len() >= ACKED_PACKETS_MAX {
-                            state.acked_packets.clear();
-                        }
-                        state.acked_packets.insert(packet_no);
-                    }
-                    let from_norm = normalize_addr(from);
-                    for message in state.messages.iter_mut().rev() {
-                        if !message.is_me || normalize_addr(message.to) != from_norm {
-                            continue;
-                        }
-                        let matches = message.packet_no == packet_no
-                            || message
-                                .file
-                                .as_ref()
-                                .map(|f| f.packet_no == packet_no)
-                                .unwrap_or(false);
-                        if matches {
-                            message.delivered = true;
-                            // 确认迟到（晚于 ACK_TIMEOUT 标记失败）时恢复气泡状态。
-                            message.failed = false;
-                            changed = true;
-                            should_persist = true;
-                            updated_message = Some(message.clone());
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            StateCmd::PushOutgoing(mut msg) => {
-                if msg.id == 0 {
-                    msg.id = next_message_id();
-                }
-                // Race guard: the peer's RECVMSG can be processed by the event
-                // pump before this task dispatches PushOutgoing, in which case
-                // the ack was recorded in acked_packets with no message to
-                // attach it to yet.
-                if msg.packet_no != 0 && state.acked_packets.contains(&msg.packet_no) {
-                    msg.delivered = true;
-                }
-                // 纯文本消息走 SENDCHECKOPT：超时未确认要标记失败并提供重试
-                // （文件消息有自己的传输状态流，不在此列）。
-                let watch_ack = msg.packet_no != 0 && !msg.delivered && msg.file.is_none();
-                let watch_packet_no = msg.packet_no;
-                state.messages.push(msg.clone());
-                emit_delta(StateDelta::MessageAdded { message: msg });
-                changed = true;
-                should_persist = true;
-                if watch_ack {
-                    arm_ack_timer(watch_packet_no);
-                }
-            }
-            StateCmd::AckTimeout { packet_no } => {
-                for message in state.messages.iter_mut().rev() {
-                    if message.is_me
-                        && message.packet_no == packet_no
-                        && message.file.is_none()
-                    {
-                        if !message.delivered && !message.failed {
-                            message.failed = true;
-                            changed = true;
-                            should_persist = true;
-                            updated_message = Some(message.clone());
-                        }
-                        break;
-                    }
-                }
-            }
-            StateCmd::UpdateProgress {
-                from,
-                file_id,
-                packet_no,
-                target_outgoing,
-                progress,
-                file_name,
-                local_path,
-                saved,
-                error,
-                canceled,
-            } => {
-                let from_norm = normalize_addr(from);
-                for message in state.messages.iter_mut().rev() {
-                    if let Some(target) = target_outgoing
-                        && message.is_me != target
-                    {
-                        continue;
-                    }
-                    if let Some(file) = &mut message.file {
-                        let matched_peer = if message.is_me {
-                            normalize_addr(message.to) == from_norm
-                        } else {
-                            message.from == from_norm
-                        };
-                        if matched_peer && file.packet_no == packet_no && file.file_id == file_id {
-                            file.received = progress;
-                            if let Some(name) = file_name {
-                                file.current_file = Some(name);
-                            }
-                            if let Some(path) = local_path {
-                                file.local_path = Some(path);
-                            }
-                            if let Some(is_saved) = saved {
-                                file.saved = is_saved;
-                            }
-                            if let Some(has_error) = error {
-                                file.error = has_error;
-                            }
-                            if let Some(is_canceled) = canceled {
-                                file.canceled = is_canceled;
-                            }
-                            if saved.unwrap_or(false)
-                                || error.unwrap_or(false)
-                                || canceled.unwrap_or(false)
-                            {
-                                should_persist = true;
-                            }
-                            changed = true;
-                            updated_message = Some(message.clone());
-                            break;
-                        }
-                    }
-                }
-            }
-            StateCmd::ClearUnread { addr } => {
-                let addr_norm = normalize_addr(addr);
-                if state.unread_counts.remove(&addr_norm).is_some() {
-                    emit_delta(StateDelta::UnreadChanged {
-                        addr: addr_norm,
-                        unread: 0,
-                    });
-                    changed = true;
-                }
-            }
-            StateCmd::RetryFinished {
-                id,
-                ok,
-                packet_no,
-                file_id,
-            } => {
-                if !ok {
-                    continue;
-                }
-                for message in state.messages.iter_mut().rev() {
-                    if message.id == id {
-                        message.failed = false;
-                        message.delivered = false;
-                        message.packet_no = packet_no;
-                        if let Some(file) = &mut message.file {
-                            file.packet_no = packet_no;
-                            file.file_id = file_id;
-                        }
-                        // Same race guard as PushOutgoing: the peer may have
-                        // acked the retried packet before we got here.
-                        if packet_no != 0 && state.acked_packets.contains(&packet_no) {
-                            message.delivered = true;
-                        }
-                        changed = true;
-                        should_persist = true;
-                        updated_message = Some(message.clone());
-                        // 重发后同样要等待确认，超时再次标记失败。
-                        if packet_no != 0 && !message.delivered && message.file.is_none() {
-                            arm_ack_timer(packet_no);
-                        }
-                        break;
-                    }
-                }
-            }
-            StateCmd::SettingsSaved => {
-                emit_delta(StateDelta::SettingsChanged);
-            }
-        }
-
-        if let Some(message) = updated_message {
-            emit_delta(StateDelta::MessageUpdated { message });
-        }
-
-        if changed {
-            {
-                let mut snap = STATE_SNAPSHOT.lock().unwrap();
-                *snap = state.clone();
-            }
-            if should_persist {
-                let _ = persist_history(&history, &state.messages);
-            }
-        }
-    }
-}
-
-pub fn init_state() {
-    let (tx, rx) = mpsc::channel(1024);
-    let _ = STATE_CMD_TX.set(tx);
-    let current_config = config::load_config();
-    rust_i18n::set_locale(current_config.ui_language.as_locale());
-    set_text_encoding(match current_config.language {
-        config::LanguageEncoding::Utf8 => TextEncoding::Utf8,
-        config::LanguageEncoding::Gb18030 => TextEncoding::Gb18030,
-    });
-    set_user_info(&current_config.user.username, &current_config.user.group);
-
-    tokio::spawn(async move {
-        tokio::spawn(run_state_manager(rx));
-        if let Ok((rx, port)) = start_ipmsg().await {
-            let mut ipmsg_rx = rx;
-            let self_name = current_config.user.username.clone();
-            let self_group = current_config.user.group.clone();
-            let self_host = hostname::get()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let self_addr = detect_self_addr(port)
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
-            let _ = state_cmd_tx()
-                .send(StateCmd::InitSelf {
-                    user: self_name,
-                    group: self_group,
-                    host: self_host,
-                    addr: self_addr,
-                })
-                .await;
-
-            // Lagged must NOT terminate the pump: it only means some events
-            // were dropped because we fell behind. Exiting the loop here would
-            // permanently silence all network events (P0-1 in docs/architecture.md).
-            loop {
-                match ipmsg_rx.recv().await {
-                    Ok(ev) => {
-                        let _ = state_cmd_tx().send(StateCmd::ApplyEvent(ev)).await;
-                    }
-                    Err(RecvError::Lagged(missed)) => {
-                        log::warn!("ipmsg event pump lagged, {} events lost", missed);
-                    }
-                    Err(RecvError::Closed) => break,
-                }
-            }
-        }
-    });
-}
-
-pub fn dispatch_cmd(cmd: StateCmd) {
-    if let Err(err) = state_cmd_tx().try_send(cmd) {
-        match err {
-            mpsc::error::TrySendError::Full(cmd) => {
-                let tx = state_cmd_tx().clone();
-                std::thread::spawn(move || {
-                    let _ = tx.blocking_send(cmd);
-                });
-            }
-            mpsc::error::TrySendError::Closed(_) => {}
-        }
-    }
-}
-
-pub fn get_self_addr_info() -> Option<OnlineUser> {
-    let state = STATE_SNAPSHOT.lock().unwrap();
-    if let Some(addr) = state.self_addr {
-        state.online_users.get(&addr).cloned()
-    } else {
-        None
-    }
 }
 
 fn format_size(size: u64) -> String {

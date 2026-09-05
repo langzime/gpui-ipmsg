@@ -1,4 +1,5 @@
 use super::ChatShell;
+use crate::chat_shell::display_text;
 use gpui::*;
 use gpui_component::{
     ActiveTheme, Sizable, StyledExt,
@@ -33,13 +34,20 @@ impl ChatShell {
 
         let mut message_list = div().v_flex().gap_2().p_4();
         for (index, message) in messages.iter().enumerate() {
-            let text = message.text.clone();
+            let message = message.clone();
+            let text = display_text(&message);
+            // 会话对端地址：气泡操作（接收/取消/重试）都以对端为目标。
+            let peer = if message.is_me {
+                message.to
+            } else {
+                message.from
+            };
             let mut bubble = div()
                 .max_w(px(460.))
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(if message.from_me {
+                .bg(if message.is_me {
                     theme.primary.opacity(0.18)
                 } else {
                     theme.secondary
@@ -96,7 +104,7 @@ impl ChatShell {
                                     })),
                             ),
                     );
-            } else if message.from_me && message.delivered {
+            } else if message.is_me && message.delivered {
                 bubble = bubble.child(
                     div()
                         .mt_1()
@@ -117,7 +125,7 @@ impl ChatShell {
                     && !transfer.error
                     && !transfer.canceled
                     && (transfer.received > 0 || transfer.current_file.is_some());
-                let status = if message.from_me {
+                let status = if message.is_me {
                     if transfer.canceled {
                         t!("transfer.canceled").to_string()
                     } else if transfer.error {
@@ -169,7 +177,7 @@ impl ChatShell {
                             .child(status),
                     );
 
-                if !message.from_me && !transfer.saved && !transfer.error && !transfer.canceled {
+                if !message.is_me && !transfer.saved && !transfer.error && !transfer.canceled {
                     let transfer = transfer.clone();
                     status_row = status_row.child(
                         Button::new(format!(
@@ -180,10 +188,10 @@ impl ChatShell {
                         .ghost()
                         .label(t!("chat.cancel_receive").to_string())
                         .on_click(cx.listener(move |this, _, _, _cx| {
-                            this.cancel_transfer(transfer.clone(), false);
+                            this.cancel_transfer(peer, transfer.clone(), false);
                         })),
                     );
-                } else if message.from_me && !transfer.saved && !transfer.error && !transfer.canceled {
+                } else if message.is_me && !transfer.saved && !transfer.error && !transfer.canceled {
                     let transfer = transfer.clone();
                     status_row = status_row.child(
                         Button::new(format!(
@@ -194,10 +202,10 @@ impl ChatShell {
                         .ghost()
                         .label(t!("chat.cancel_send").to_string())
                         .on_click(cx.listener(move |this, _, _, _cx| {
-                            this.cancel_transfer(transfer.clone(), true);
+                            this.cancel_transfer(peer, transfer.clone(), true);
                         })),
                     );
-                } else if transfer.local_path.is_some() && (message.from_me || transfer.saved) {
+                } else if transfer.local_path.is_some() && (message.is_me || transfer.saved) {
                     let transfer = transfer.clone();
                     status_row = status_row.child(
                         Button::new(format!(
@@ -215,7 +223,7 @@ impl ChatShell {
 
                 bubble = bubble.child(status_row);
 
-                if !message.from_me && !transfer.saved && !transfer.canceled {
+                if !message.is_me && !transfer.saved && !transfer.canceled {
                     let transfer = transfer.clone();
                     if is_receiving {
                         if transfer.is_dir {
@@ -273,7 +281,7 @@ impl ChatShell {
                                     .primary()
                                     .label(t!("chat.receive").to_string())
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.receive_attachment(transfer.clone(), window, cx);
+                                        this.receive_attachment(peer, transfer.clone(), window, cx);
                                     })),
                             ),
                         );
@@ -281,7 +289,7 @@ impl ChatShell {
                 }
             }
 
-            let avatar = if message.from_me {
+            let avatar = if message.is_me {
                 div()
                     .h_flex()
                     .w(px(28.))
@@ -311,7 +319,7 @@ impl ChatShell {
                     .child(peer_avatar.clone())
             };
 
-            let row = if message.from_me {
+            let row = if message.is_me {
                 div()
                     .h_flex()
                     .items_start()

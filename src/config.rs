@@ -2,18 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LanguageEncoding {
     #[serde(rename = "UTF-8")]
     Utf8,
     #[serde(rename = "GB18030")]
+    #[default]
     Gb18030,
-}
-
-impl Default for LanguageEncoding {
-    fn default() -> Self {
-        Self::Gb18030
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

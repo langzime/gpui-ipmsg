@@ -1,23 +1,18 @@
-use crate::app_state::{self, ChatMessage, StateCmd};
+use crate::app_state::{self, AppState, ChatMessage, FileInfo, StateCmd};
 use crate::config::{self, AppConfig, LanguageEncoding, UiLanguage};
 use crate::ipmsg_core;
 use once_cell::sync::OnceCell;
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
 use std::future::pending;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Handle};
-use tokio::task::JoinHandle;
 
 static RUNTIME_HANDLE: OnceCell<Handle> = OnceCell::new();
 static STARTED: OnceCell<()> = OnceCell::new();
-static ACTIVE_DOWNLOADS: Lazy<Mutex<HashMap<String, JoinHandle<()>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn download_key(from: SocketAddr, packet_no: u32, file_id: u32) -> String {
     format!("{}-{}-{}", from, packet_no, file_id)
@@ -42,14 +37,18 @@ pub fn ensure_started() {
         return;
     }
     STARTED.get_or_init(|| {
-        thread::spawn(|| {
+        // 状态实例与协议服务在 tokio runtime 之外同步创建并注册，
+        // 主线程随后可从 GPUI Global / `app_state()` 无竞态取用。
+        let app_state = Arc::new(AppState::new());
+        app_state::set_instance(Arc::clone(&app_state));
+        thread::spawn(move || {
             let runtime = Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");
             let _ = RUNTIME_HANDLE.set(runtime.handle().clone());
             runtime.block_on(async {
-                app_state::init_state();
+                app_state.init();
                 pending::<()>().await;
             });
         });
@@ -64,26 +63,30 @@ pub fn ensure_started() {
 pub fn shutdown() {
     if let Some(handle) = RUNTIME_HANDLE.get() {
         handle.block_on(async {
-            let _ = ipmsg_core::send_exit().await;
+            if let Some(service) = ipmsg_core::try_service() {
+                let _ = service.send_exit().await;
+            }
         });
     }
     std::process::exit(0);
 }
 
-pub fn send_text(to: SocketAddr, text: String) {
+pub fn send_text(to: SocketAddr, text: String, app_state: &Arc<AppState>) {
     if text.trim().is_empty() {
         return;
     }
     let Some(handle) = RUNTIME_HANDLE.get() else {
         return;
     };
+    let app_state = Arc::clone(app_state);
 
     handle.spawn(async move {
-        let sent = ipmsg_core::send_message(to, text.clone()).await;
+        let service = ipmsg_core::service();
+        let sent = service.send_message(to, text.clone()).await;
         if let Err(err) = &sent {
             log::warn!("send_message to {} failed: {}", to, err);
         }
-        if let Some(me) = app_state::get_self_addr_info() {
+        if let Some(me) = app_state.get_self_addr_info() {
             let msg = ChatMessage {
                 from: me.addr,
                 to,
@@ -96,25 +99,27 @@ pub fn send_text(to: SocketAddr, text: String) {
                 delivered: false,
                 id: 0,
             };
-            app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
+            app_state.dispatch(StateCmd::PushOutgoing(msg));
         }
     });
 }
 
-pub fn send_files(to: SocketAddr, paths: Vec<String>) {
+pub fn send_files(to: SocketAddr, paths: Vec<String>, app_state: &Arc<AppState>) {
     if paths.is_empty() {
         return;
     }
     let Some(handle) = RUNTIME_HANDLE.get() else {
         return;
     };
+    let app_state = Arc::clone(app_state);
 
     handle.spawn(async move {
-        let send_result = ipmsg_core::send_files(to, paths.clone()).await;
+        let service = ipmsg_core::service();
+        let send_result = service.send_files(to, paths.clone()).await;
         if let Err(err) = &send_result {
             log::warn!("send_files to {} failed: {}", to, err);
         }
-        if let Some(me) = app_state::get_self_addr_info() {
+        if let Some(me) = app_state.get_self_addr_info() {
             match send_result {
                 Ok(sent_items) => {
                     for item in sent_items {
@@ -124,7 +129,7 @@ pub fn send_files(to: SocketAddr, paths: Vec<String>) {
                             is_me: true,
                             text: String::new(),
                             time: t!("time.now").to_string(),
-                            file: Some(app_state::FileInfo {
+                            file: Some(FileInfo {
                                 packet_no: item.packet_no,
                                 file_id: item.file_id,
                                 name: item.name,
@@ -143,7 +148,7 @@ pub fn send_files(to: SocketAddr, paths: Vec<String>) {
                             delivered: false,
                             id: 0,
                         };
-                        app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
+                        app_state.dispatch(StateCmd::PushOutgoing(msg));
                     }
                 }
                 Err(_) => {
@@ -158,7 +163,7 @@ pub fn send_files(to: SocketAddr, paths: Vec<String>) {
                             is_me: true,
                             text: String::new(),
                             time: t!("time.now").to_string(),
-                            file: Some(app_state::FileInfo {
+                            file: Some(FileInfo {
                                 packet_no: 0,
                                 file_id: 0,
                                 name,
@@ -177,7 +182,7 @@ pub fn send_files(to: SocketAddr, paths: Vec<String>) {
                             delivered: false,
                             id: 0,
                         };
-                        app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
+                        app_state.dispatch(StateCmd::PushOutgoing(msg));
                     }
                 }
             }
@@ -185,20 +190,22 @@ pub fn send_files(to: SocketAddr, paths: Vec<String>) {
     });
 }
 
-pub fn send_folder(to: SocketAddr, path: String) {
+pub fn send_folder(to: SocketAddr, path: String, app_state: &Arc<AppState>) {
     if path.trim().is_empty() {
         return;
     }
     let Some(handle) = RUNTIME_HANDLE.get() else {
         return;
     };
+    let app_state = Arc::clone(app_state);
 
     handle.spawn(async move {
-        let send_result = ipmsg_core::send_folder(to, path.clone()).await;
+        let service = ipmsg_core::service();
+        let send_result = service.send_folder(to, path.clone()).await;
         if let Err(err) = &send_result {
             log::warn!("send_folder to {} failed: {}", to, err);
         }
-        if let Some(me) = app_state::get_self_addr_info() {
+        if let Some(me) = app_state.get_self_addr_info() {
             let msg = match send_result {
                 Ok(item) => ChatMessage {
                     from: me.addr,
@@ -206,7 +213,7 @@ pub fn send_folder(to: SocketAddr, path: String) {
                     is_me: true,
                     text: t!("file.folder_prefix", name = item.name.clone()).to_string(),
                     time: t!("time.now").to_string(),
-                    file: Some(app_state::FileInfo {
+                    file: Some(FileInfo {
                         packet_no: item.packet_no,
                         file_id: item.file_id,
                         name: item.name,
@@ -237,7 +244,7 @@ pub fn send_folder(to: SocketAddr, path: String) {
                         is_me: true,
                         text: String::new(),
                         time: t!("time.now").to_string(),
-                        file: Some(app_state::FileInfo {
+                        file: Some(FileInfo {
                             packet_no: 0,
                             file_id: 0,
                             name,
@@ -258,7 +265,7 @@ pub fn send_folder(to: SocketAddr, path: String) {
                     }
                 }
             };
-            app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
+            app_state.dispatch(StateCmd::PushOutgoing(msg));
         }
     });
 }
@@ -266,18 +273,27 @@ pub fn send_folder(to: SocketAddr, path: String) {
 /// Retry a failed outgoing message: text is re-sent via SENDMSG, a file/folder
 /// offer is re-advertised from its local path. The state layer updates the
 /// original bubble on success (StateCmd::RetryFinished).
-pub fn retry_message(id: u64, to: SocketAddr, text: String, file: Option<(String, bool)>) {
+pub fn retry_message(
+    id: u64,
+    to: SocketAddr,
+    text: String,
+    file: Option<(String, bool)>,
+    app_state: &Arc<AppState>,
+) {
     let Some(handle) = RUNTIME_HANDLE.get() else {
         return;
     };
+    let app_state = Arc::clone(app_state);
     handle.spawn(async move {
+        let service = ipmsg_core::service();
         let (ok, packet_no, file_id) = if let Some((path, is_dir)) = file {
             let send_result = if is_dir {
-                ipmsg_core::send_folder(to, path)
+                service
+                    .send_folder(to, path)
                     .await
                     .map(|item| vec![item])
             } else {
-                ipmsg_core::send_files(to, vec![path]).await
+                service.send_files(to, vec![path]).await
             };
             match send_result {
                 Ok(mut items) if !items.is_empty() => {
@@ -291,13 +307,13 @@ pub fn retry_message(id: u64, to: SocketAddr, text: String, file: Option<(String
                 _ => (false, 0, 0),
             }
         } else {
-            let sent = ipmsg_core::send_message(to, text.clone()).await;
+            let sent = service.send_message(to, text.clone()).await;
             if let Err(err) = &sent {
                 log::warn!("retry send_message to {} failed: {}", to, err);
             }
             (sent.is_ok(), sent.unwrap_or(0), 0)
         };
-        app_state::dispatch_cmd(StateCmd::RetryFinished {
+        app_state.dispatch(StateCmd::RetryFinished {
             id,
             ok,
             packet_no,
@@ -312,21 +328,24 @@ pub fn download_file(
     file_id: u32,
     size: u64,
     save_path: String,
+    app_state: &Arc<AppState>,
 ) {
     let Some(handle) = RUNTIME_HANDLE.get() else {
         return;
     };
     let key = download_key(from, packet_no, file_id);
-    if let Some(previous) = ACTIVE_DOWNLOADS.lock().unwrap().remove(&key) {
+    if let Some(previous) = app_state.take_download(&key) {
         previous.abort();
     }
     let save_path_for_state = save_path.clone();
     let key_for_task = key.clone();
+    let app_state_for_task = Arc::clone(app_state);
     let join = handle.spawn(async move {
+        let service = ipmsg_core::service();
         let mut last_update = Instant::now();
-        let result = ipmsg_core::recv_file(from, packet_no, file_id, size, save_path, |progress| {
+        let result = service.recv_file(from, packet_no, file_id, size, save_path, |progress| {
             if last_update.elapsed() >= Duration::from_millis(100) || progress == size {
-                app_state::dispatch_cmd(StateCmd::UpdateProgress {
+                app_state_for_task.dispatch(StateCmd::UpdateProgress {
                     from,
                     file_id,
                     packet_no,
@@ -345,7 +364,7 @@ pub fn download_file(
 
         match result {
             Ok(_) => {
-                app_state::dispatch_cmd(StateCmd::UpdateProgress {
+                app_state_for_task.dispatch(StateCmd::UpdateProgress {
                     from,
                     file_id,
                     packet_no,
@@ -359,7 +378,7 @@ pub fn download_file(
                 });
             }
             Err(_) => {
-                app_state::dispatch_cmd(StateCmd::UpdateProgress {
+                app_state_for_task.dispatch(StateCmd::UpdateProgress {
                     from,
                     file_id,
                     packet_no,
@@ -373,28 +392,36 @@ pub fn download_file(
                 });
             }
         }
-        ACTIVE_DOWNLOADS.lock().unwrap().remove(&key_for_task);
+        app_state_for_task.take_download(&key_for_task);
     });
-    ACTIVE_DOWNLOADS.lock().unwrap().insert(key, join);
+    app_state.insert_download(key, join);
 }
 
-pub fn download_folder(from: SocketAddr, packet_no: u32, file_id: u32, save_path: String) {
+pub fn download_folder(
+    from: SocketAddr,
+    packet_no: u32,
+    file_id: u32,
+    save_path: String,
+    app_state: &Arc<AppState>,
+) {
     let Some(handle) = RUNTIME_HANDLE.get() else {
         return;
     };
     let key = download_key(from, packet_no, file_id);
-    if let Some(previous) = ACTIVE_DOWNLOADS.lock().unwrap().remove(&key) {
+    if let Some(previous) = app_state.take_download(&key) {
         previous.abort();
     }
     let save_path_for_state = save_path.clone();
     let key_for_task = key.clone();
+    let app_state_for_task = Arc::clone(app_state);
     let join = handle.spawn(async move {
+        let service = ipmsg_core::service();
         let mut last_update = Instant::now();
         let mut last_file_name = String::new();
-        let result = ipmsg_core::recv_folder(from, packet_no, file_id, save_path, |progress, current_file| {
+        let result = service.recv_folder(from, packet_no, file_id, save_path, |progress, current_file| {
             let file_changed = current_file != last_file_name;
             if file_changed || last_update.elapsed() >= Duration::from_millis(100) {
-                app_state::dispatch_cmd(StateCmd::UpdateProgress {
+                app_state_for_task.dispatch(StateCmd::UpdateProgress {
                     from,
                     file_id,
                     packet_no,
@@ -414,7 +441,7 @@ pub fn download_folder(from: SocketAddr, packet_no: u32, file_id: u32, save_path
 
         match result {
             Ok(_) => {
-                app_state::dispatch_cmd(StateCmd::UpdateProgress {
+                app_state_for_task.dispatch(StateCmd::UpdateProgress {
                     from,
                     file_id,
                     packet_no,
@@ -428,7 +455,7 @@ pub fn download_folder(from: SocketAddr, packet_no: u32, file_id: u32, save_path
                 });
             }
             Err(_) => {
-                app_state::dispatch_cmd(StateCmd::UpdateProgress {
+                app_state_for_task.dispatch(StateCmd::UpdateProgress {
                     from,
                     file_id,
                     packet_no,
@@ -442,17 +469,17 @@ pub fn download_folder(from: SocketAddr, packet_no: u32, file_id: u32, save_path
                 });
             }
         }
-        ACTIVE_DOWNLOADS.lock().unwrap().remove(&key_for_task);
+        app_state_for_task.take_download(&key_for_task);
     });
-    ACTIVE_DOWNLOADS.lock().unwrap().insert(key, join);
+    app_state.insert_download(key, join);
 }
 
-pub fn cancel_download(from: SocketAddr, packet_no: u32, file_id: u32) {
+pub fn cancel_download(from: SocketAddr, packet_no: u32, file_id: u32, app_state: &Arc<AppState>) {
     let key = download_key(from, packet_no, file_id);
-    if let Some(handle) = ACTIVE_DOWNLOADS.lock().unwrap().remove(&key) {
+    if let Some(handle) = app_state.take_download(&key) {
         handle.abort();
     }
-    app_state::dispatch_cmd(StateCmd::UpdateProgress {
+    app_state.dispatch(StateCmd::UpdateProgress {
         from,
         file_id,
         packet_no,
@@ -466,9 +493,9 @@ pub fn cancel_download(from: SocketAddr, packet_no: u32, file_id: u32) {
     });
 }
 
-pub fn cancel_upload(to: SocketAddr, packet_no: u32, file_id: u32) {
-    let _ = ipmsg_core::cancel_send(to, packet_no, file_id);
-    app_state::dispatch_cmd(StateCmd::UpdateProgress {
+pub fn cancel_upload(to: SocketAddr, packet_no: u32, file_id: u32, app_state: &Arc<AppState>) {
+    let _ = ipmsg_core::service().cancel_send(to, packet_no, file_id);
+    app_state.dispatch(StateCmd::UpdateProgress {
         from: to,
         file_id,
         packet_no,
@@ -514,7 +541,6 @@ pub fn open_in_folder(path: String, is_dir: bool) {
                 .unwrap_or_else(|| PathBuf::from("."));
             let _ = Command::new("explorer").arg(fallback_dir).spawn();
         }
-        return;
     }
 
     #[cfg(target_os = "macos")]
@@ -550,6 +576,7 @@ pub fn save_settings(
     group: String,
     language: LanguageEncoding,
     ui_language: UiLanguage,
+    app_state: &Arc<AppState>,
 ) -> Result<(), String> {
     let mut current = config::load_config();
     current.user.username = username.clone();
@@ -559,19 +586,20 @@ pub fn save_settings(
     config::save_config(&current).map_err(|e| e.to_string())?;
     rust_i18n::set_locale(ui_language.as_locale());
 
-    ipmsg_core::set_text_encoding(match language {
+    let service = ipmsg_core::service();
+    service.set_text_encoding(match language {
         LanguageEncoding::Utf8 => ipmsg_core::TextEncoding::Utf8,
         LanguageEncoding::Gb18030 => ipmsg_core::TextEncoding::Gb18030,
     });
-    ipmsg_core::set_user_info(&username, &group);
+    service.set_user_info(&username, &group);
     if let Some(handle) = RUNTIME_HANDLE.get() {
         handle.spawn(async move {
-            let _ = ipmsg_core::send_broadcast_entry().await;
+            let _ = ipmsg_core::service().send_broadcast_entry().await;
         });
     }
 
-    if let Some(me) = app_state::get_self_addr_info() {
-        app_state::dispatch_cmd(StateCmd::InitSelf {
+    if let Some(me) = app_state.get_self_addr_info() {
+        app_state.dispatch(StateCmd::InitSelf {
             user: username,
             group,
             host: me.host,
@@ -579,7 +607,7 @@ pub fn save_settings(
         });
     }
     // 通知 UI 刷新本地化文案（UI 语言可能已切换），替代原先的 config 轮询探测。
-    app_state::dispatch_cmd(StateCmd::SettingsSaved);
+    app_state.dispatch(StateCmd::SettingsSaved);
 
     Ok(())
 }
