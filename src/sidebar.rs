@@ -318,7 +318,8 @@ impl ChatShell {
                     .ghost()
                     .icon(IconName::Settings)
                     .on_click(move |_, window, cx| {
-                        let existing = cx.global_mut::<SettingsWindowHandle>().0;
+                        // 未初始化时自动插入默认值，避免 global_mut 崩溃（GPUI Global 需先 set）。
+                        let existing = cx.default_global::<SettingsWindowHandle>().0;
                         if let Some(handle) = existing {
                             if handle
                                 .update(cx, |_, window, _| {
@@ -330,7 +331,7 @@ impl ChatShell {
                                 return;
                             }
                             // 窗口已销毁，清掉陈旧句柄后重新打开。
-                            cx.global_mut::<SettingsWindowHandle>().0 = None;
+                            cx.default_global::<SettingsWindowHandle>().0 = None;
                         }
                         let main_size = window.viewport_size();
                         let settings_size = size(main_size.width / 2., main_size.height * 0.70);
@@ -349,13 +350,13 @@ impl ChatShell {
                             cx.new(|cx| Root::new(view, window, cx))
                         }) {
                             Ok(handle) => {
-                                cx.global_mut::<SettingsWindowHandle>().0 = Some(handle.into());
+                                cx.default_global::<SettingsWindowHandle>().0 = Some(handle.into());
                                 let _ = handle.update(cx, |_, window, _| {
                                     window.activate_window();
                                 });
                             }
                             Err(_) => {
-                                cx.global_mut::<SettingsWindowHandle>().0 = None;
+                                cx.default_global::<SettingsWindowHandle>().0 = None;
                             }
                         }
                         cx.stop_propagation();
