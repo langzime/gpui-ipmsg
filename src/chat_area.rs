@@ -32,8 +32,10 @@ impl ChatShell {
             .map(|ch| ch.to_string())
             .unwrap_or_else(|| "?".to_string());
 
-        let mut message_list = div().v_flex().gap_2().p_4();
-        for (index, message) in messages.iter().enumerate() {
+        // 每行是滚动容器的直接子元素（稳定 id = message.id），`scroll_to_item`
+        // 才能按行索引定位，供上翻 prepend 后恢复视口位置。
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(messages.len());
+        for message in messages.iter() {
             let message = message.clone();
             let text = display_text(&message);
             // 会话对端地址：气泡操作（接收/取消/重试）都以对端为目标。
@@ -337,7 +339,7 @@ impl ChatShell {
                     .child(bubble)
             };
 
-            message_list = message_list.child(div().id(format!("msg-{}", index)).child(row));
+            rows.push(div().id(format!("msg-{}", message.id)).child(row).into_any_element());
         }
 
         div()
@@ -374,10 +376,12 @@ impl ChatShell {
                                                 .id("message-scroll")
                                                 .v_flex()
                                                 .size_full()
+                                                .gap_2()
+                                                .p_4()
                                                 .track_scroll(&self.message_scroll_handle)
                                                 .overflow_y_scroll()
                                                 .vertical_scrollbar(&self.message_scroll_handle)
-                                                .child(message_list),
+                                                .children(rows),
                                         ),
                                 ),
                         )

@@ -29,12 +29,16 @@ pub(crate) struct UiState {
     messages_by_conversation: HashMap<String, Vec<app_state::ChatMessage>>,
     unread: HashMap<SocketAddr, u32>,
     users: Vec<app_state::OnlineUser>,
+    /// 各会话是否还有未同步的更早历史（上翻经 LoadMore 按需加载）。
+    has_more: HashMap<SocketAddr, bool>,
 }
 
 #[derive(Debug)]
 pub(crate) enum UiEvent {
     /// 新消息进入某会话（订阅方据此决定是否自动滚动到底部）。
     MessageAdded { conv_id: String },
+    /// 上翻加载到更早历史；`count` 为实际 prepend 条数，订阅方据此恢复滚动位置。
+    MessagesLoaded { conv_id: String, count: usize },
     /// 设置已保存，UI 语言可能已切换。
     SettingsChanged,
     /// 其余数据变化（初始同步、用户列表、传输进度、未读）。
@@ -114,7 +118,10 @@ impl UiState {
 
     fn apply(&mut self, delta: app_state::StateDelta, cx: &mut Context<Self>) {
         match delta {
-            app_state::StateDelta::Sync { messages } => {
+            app_state::StateDelta::Sync {
+                messages,
+                has_more,
+            } => {
                 let mut grouped = HashMap::<String, Vec<app_state::ChatMessage>>::new();
                 for message in &messages {
                     grouped
@@ -123,6 +130,7 @@ impl UiState {
                         .push(message.clone());
                 }
                 self.messages_by_conversation = grouped;
+                self.has_more = has_more;
                 self.rebuild_conversations();
                 cx.emit(UiEvent::Changed);
             }
@@ -142,12 +150,45 @@ impl UiState {
             }
             app_state::StateDelta::MessageUpdated { message } => {
                 let conv_id = peer_addr(&message).to_string();
-                if let Some(list) = self.messages_by_conversation.get_mut(&conv_id)
+                let hit = if let Some(list) = self.messages_by_conversation.get_mut(&conv_id)
                     && let Some(pos) = list.iter().position(|m| m.id == message.id)
                 {
-                    list[pos] = message;
-                }
+                    list[pos] = message.clone();
+                    true
+                } else {
+                    false
+                };
+                log::info!(
+                    "ui: MessageUpdated id={} conv={} hit={} file_error={} sending={}",
+                    message.id,
+                    conv_id,
+                    hit,
+                    message.file.as_ref().map(|f| f.error).unwrap_or(false),
+                    message.file.as_ref().map(|f| f.sending).unwrap_or(false),
+                );
                 cx.emit(UiEvent::Changed);
+            }
+            app_state::StateDelta::MessagesLoaded {
+                addr,
+                messages,
+                has_more,
+            } => {
+                // 批量更早历史 prepend 到会话头部。按 id 去重：极端情况下同一
+                // 游标可能被重复派发（会话切换等竞态），避免重复插入。
+                let id = addr.to_string();
+                self.has_more.insert(addr, has_more);
+                let list = self
+                    .messages_by_conversation
+                    .entry(id.clone())
+                    .or_default();
+                let mut older = messages;
+                let existing: std::collections::HashSet<u64> =
+                    list.iter().map(|m| m.id).collect();
+                older.retain(|m| !existing.contains(&m.id));
+                let count = older.len();
+                older.append(list);
+                *list = older;
+                cx.emit(UiEvent::MessagesLoaded { conv_id: id, count });
             }
             app_state::StateDelta::UnreadChanged { addr, unread } => {
                 self.unread.insert(addr, unread);
@@ -177,6 +218,24 @@ impl UiState {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// 上翻判定输入：该会话是否还有更早历史（has_more），以及当前最旧消息的
+    /// id（作为 LoadMore 的 `before_id` 游标）。
+    pub(crate) fn oldest_id_and_has_more(&self, conv_id: &str) -> (bool, Option<u64>) {
+        let has_more = self
+            .messages_by_conversation
+            .get(conv_id)
+            .and_then(|_| {
+                let addr = conv_id.parse::<SocketAddr>().ok()?;
+                self.has_more.get(&addr).copied()
+            })
+            .unwrap_or(false);
+        let oldest = self
+            .messages_by_conversation
+            .get(conv_id)
+            .and_then(|msgs| msgs.first().map(|m| m.id));
+        (has_more, oldest)
+    }
 }
 
 pub(crate) struct ChatShell {
@@ -191,6 +250,10 @@ pub(crate) struct ChatShell {
     pub(crate) app_state: Arc<AppState>,
     pending_scroll_to_bottom_frames: u8,
     stick_to_bottom: bool,
+    /// 上翻加载更早历史：节流标记（防重复派发）与滚动锚点（prepend 后恢复
+    /// 视口位置，记录的是派发时顶部可见行的子元素索引）。
+    loading_more: bool,
+    load_more_anchor: Option<usize>,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -234,6 +297,42 @@ impl ChatShell {
         (current + bottom).abs() <= px(80.)
     }
 
+    /// 上翻接近顶部且该会话还有更早历史时，按需加载一批（LoadMore）。
+    /// 与 `stick_to_bottom` 同模式在 render 里检测；`loading_more` 节流保证
+    /// 同一时刻最多一个在途请求。内容不足一屏时 offset 恒为 0，也会命中此
+    /// 分支——这正好让短会话自动加载完整个历史。
+    fn maybe_load_more_history(&mut self, cx: &mut Context<Self>) {
+        if self.loading_more {
+            return;
+        }
+        // offset <= 0，接近顶部即接近 0。
+        if self.message_scroll_handle.offset().y >= px(-24.) {
+            let Some(selected_id) = self.selected_id.clone() else {
+                return;
+            };
+            let Ok(addr) = selected_id.parse::<SocketAddr>() else {
+                return;
+            };
+            let (has_more, oldest) = self
+                .ui_state
+                .read(cx)
+                .oldest_id_and_has_more(&selected_id);
+            let Some(before_id) = oldest else {
+                return;
+            };
+            if !has_more {
+                return;
+            }
+            self.load_more_anchor = Some(self.message_scroll_handle.top_item());
+            self.loading_more = true;
+            self.app_state.dispatch(app_state::StateCmd::LoadMore {
+                addr,
+                before_id,
+                limit: app_state::LOAD_MORE_LIMIT,
+            });
+        }
+    }
+
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t!("chat.search_placeholder").to_string())
@@ -255,6 +354,7 @@ impl ChatShell {
             messages_by_conversation: HashMap::new(),
             unread: HashMap::new(),
             users: Vec::new(),
+            has_more: HashMap::new(),
         });
 
         let mut this = Self {
@@ -268,6 +368,8 @@ impl ChatShell {
             app_state,
             pending_scroll_to_bottom_frames: 0,
             stick_to_bottom: true,
+            loading_more: false,
+            load_more_anchor: None,
             _subscriptions: Vec::new(),
             _tasks: Vec::new(),
         };
@@ -305,6 +407,7 @@ impl ChatShell {
             &this.ui_state,
             window,
             |this, _, event, window, cx| {
+                log::info!("chat_shell: UiEvent {:?}", event);
                 match event {
                     UiEvent::MessageAdded { conv_id } => {
                         if this.selected_id.as_ref() == Some(conv_id) && this.stick_to_bottom {
@@ -313,6 +416,23 @@ impl ChatShell {
                     }
                     UiEvent::SettingsChanged => {
                         this.update_localized_placeholders(window, cx);
+                    }
+                    UiEvent::MessagesLoaded { conv_id, count } => {
+                        // 恢复视口：新行插到列表头部，原锚点行（派发时顶部可见）
+                        // 位移到 anchor+count，FirstVisible 策略最小滚动保持可见。
+                        if this.selected_id.as_ref() == Some(conv_id) {
+                            if this.stick_to_bottom {
+                                // 处于底部（内容不足一屏自动加载等）：保持钉底，
+                                // 否则加载完历史后视口会停在最旧消息处。
+                                this.message_scroll_handle.scroll_to_bottom();
+                            } else if let Some(anchor) = this.load_more_anchor {
+                                this.message_scroll_handle.scroll_to_item(anchor + count);
+                            }
+                        }
+                        // 节流与锚点复位；若结果对应已切换的会话，select_conversation
+                        // 已重置过这两个标记，这里再清一次无副作用。
+                        this.load_more_anchor = None;
+                        this.loading_more = false;
                     }
                     UiEvent::Changed => {}
                 }
@@ -348,6 +468,9 @@ impl ChatShell {
                 .dispatch(app_state::StateCmd::ClearUnread { addr });
         }
         self.message_scroll_handle.scroll_to_bottom();
+        // 切换会话：清掉上翻加载的在途标记，避免旧会话的结果污染新会话。
+        self.loading_more = false;
+        self.load_more_anchor = None;
         cx.notify();
     }
 
@@ -516,6 +639,7 @@ impl Render for ChatShell {
             }
         }
         self.clear_selected_unread_if_needed(cx);
+        self.maybe_load_more_history(cx);
         if self.pending_scroll_to_bottom_frames > 0 {
             self.message_scroll_handle.scroll_to_bottom();
             self.pending_scroll_to_bottom_frames -= 1;

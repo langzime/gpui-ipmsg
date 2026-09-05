@@ -207,6 +207,14 @@ pub enum Event {
         file_id: u32,
         is_dir: bool,
     },
+    /// 发送文件/目录时传输中断（对端中止接收、断网等；我方主动取消除外，
+    /// 取消由取消令牌区分、不发本事件）。用于把发送气泡从"发送中"置为失败。
+    FileServeFailed {
+        to: SocketAddr,
+        packet_no: u32,
+        file_id: u32,
+        is_dir: bool,
+    },
     /// Peer's client acknowledged receiving our SENDMSG (IPMSG_RECVMSG).
     /// `packet_no` is the id of the packet WE sent; matched against outgoing
     /// text/file messages in the state layer.
@@ -1565,6 +1573,20 @@ impl Service {
                 }
                 .await;
                 if let Err(err) = send_result {
+                    // 传输中断（对端中止接收等）：非我方主动取消时发失败事件，
+                    // 让发送气泡从"发送中"转为失败。
+                    if !cancel_token.load(Ordering::SeqCst) {
+                        info!(
+                            "emit FileServeFailed is_dir=false from {} pkt={:x} fid={:x} err={}",
+                            peer_addr, pkt_no, file_id, err
+                        );
+                        let _ = self.events.send(Event::FileServeFailed {
+                            to: peer_addr,
+                            packet_no: pkt_no,
+                            file_id,
+                            is_dir: false,
+                        });
+                    }
                     self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
                     return Err(err);
                 }
@@ -1625,6 +1647,19 @@ impl Service {
                     let send_result =
                         self.send_dir_hierarchy(&mut stream, &entry.path, cancel_token.clone()).await;
                     if let Err(err) = send_result {
+                        // 目录传输中断（对端中止接收等）：非我方主动取消时发失败事件。
+                        if !cancel_token.load(Ordering::SeqCst) {
+                            info!(
+                                "emit FileServeFailed is_dir=true from {} pkt={:x} fid={:x} err={}",
+                                peer_addr, pkt_no, file_id, err
+                            );
+                            let _ = self.events.send(Event::FileServeFailed {
+                                to: peer_addr,
+                                packet_no: pkt_no,
+                                file_id,
+                                is_dir: true,
+                            });
+                        }
                         self.clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
                         return Err(err);
                     }

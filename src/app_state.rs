@@ -58,9 +58,10 @@ pub struct ChatMessage {
     /// Peer's client confirmed receipt via IPMSG_RECVMSG.
     #[serde(default)]
     pub delivered: bool,
-    /// Stable per-process id, used by the retry flow to locate a failed
-    /// outgoing message. History-loaded messages get ids reassigned on load.
-    #[serde(default)]
+    /// 本进程内定位消息的句柄：`MessageUpdated` 原地替换与重试流程按 id 定位。
+    /// 跨重启无消费者，故不持久化（`#[serde(skip)]`：加载时为 0，由状态 actor
+    /// 统一重编号，保证运行中全局唯一）。
+    #[serde(skip)]
     pub id: u64,
 }
 
@@ -123,6 +124,14 @@ pub enum StateCmd {
     ClearUnread {
         addr: SocketAddr,
     },
+    /// 上翻加载某会话更早的历史消息。`before_id` 为 UI 侧当前最旧消息的 id
+    /// （id 顺序即插入顺序，actor 取 `id < before_id` 的最近 `limit` 条），
+    /// 由 actor 内存全量直接应答，无需回读 history.json。
+    LoadMore {
+        addr: SocketAddr,
+        before_id: u64,
+        limit: usize,
+    },
     /// Result of a retry send (user clicked 重试 on a failed bubble).
     RetryFinished {
         id: u64,
@@ -141,8 +150,11 @@ pub enum StateCmd {
 #[derive(Clone, Debug)]
 pub enum StateDelta {
     /// 全量消息同步（actor 启动时发出，通道先缓冲保序，UI 后接入也能拿到）。
+    /// 每会话最多 `SYNC_WINDOW` 条，`has_more` 标记各会话是否还有更早未同步
+    /// 的消息（上翻经 LoadMore 按需拉取）。
     Sync {
         messages: Vec<ChatMessage>,
+        has_more: HashMap<SocketAddr, bool>,
     },
     /// 在线用户变化（自条目始终包含在内，显示名即配置昵称）。
     UsersChanged {
@@ -156,6 +168,13 @@ pub enum StateDelta {
     /// 以 `message.id` 定位，接收方原地替换。
     MessageUpdated {
         message: ChatMessage,
+    },
+    /// 上翻加载到的更早历史消息（chronological 序，prepend 到会话列表头部）。
+    /// `has_more=false` 表示该会话已到底。
+    MessagesLoaded {
+        addr: SocketAddr,
+        messages: Vec<ChatMessage>,
+        has_more: bool,
     },
     /// 某会话未读数变化。
     UnreadChanged {
@@ -205,6 +224,12 @@ pub fn app_state() -> &'static Arc<AppState> {
 }
 
 const ACKED_PACKETS_MAX: usize = 4096;
+
+/// 初始同步每会话的窗口大小：更早的历史上翻时经 `LoadMore` 按需加载，
+/// 避免启动即把全部历史克隆到 UI。
+const SYNC_WINDOW: usize = 10;
+/// 每次 `LoadMore` 返回的条数（UI 侧引用此常量派发命令）。
+pub(crate) const LOAD_MORE_LIMIT: usize = 10;
 
 /// 文本消息发出后等待对端 RECVMSG 确认的时限。局域网内正常应答在毫秒级；
 /// 超时即视为对端未收到（UDP send_to 对已关闭端口依然返回成功）。
@@ -385,20 +410,44 @@ impl AppState {
             state.messages = msgs
                 .into_iter()
                 .map(|mut m| {
-                    if m.id == 0 {
-                        m.id = self.next_message_id();
-                    }
+                    // 无条件重编号：id 不持久化（serde skip），是进程内句柄。
+                    // 历史文件里残留旧版本的跨会话重复 id，若沿用会按 id 定位
+                    // 更新（送达/进度/失败/重试）时命中错误消息。加载时统一
+                    // 领用新序号，运行中全局唯一。不再回写磁盘（id 无跨重启
+                    // 消费者，启动重写 history.json 是纯副作用）。
+                    m.id = self.next_message_id();
                     m.from = normalize_addr(m.from);
                     m.to = normalize_addr(m.to);
                     m
                 })
                 .collect();
-            let _ = persist_history(&history, &state.messages);
         }
 
-        // 初始全量同步：通道先缓冲、UI 后接入也能拿到完整历史（保序）。
+        // 初始全量同步：通道先缓冲、UI 后接入也能拿到历史（保序）。每会话
+        // 只发最近 SYNC_WINDOW 条，更早的上翻时经 LoadMore 按需拉取，避免
+        // 启动即克隆全部历史。actor 内存仍持有全量（快照/持久化用它）。
+        let mut sync_messages = Vec::new();
+        let mut has_more = HashMap::<SocketAddr, bool>::new();
+        {
+            let mut grouped = HashMap::<SocketAddr, Vec<ChatMessage>>::new();
+            for m in &state.messages {
+                grouped
+                    .entry(message_peer_addr(m))
+                    .or_default()
+                    .push(m.clone());
+            }
+            for (addr, mut msgs) in grouped {
+                let more = msgs.len() > SYNC_WINDOW;
+                has_more.insert(addr, more);
+                if more {
+                    msgs.drain(..msgs.len() - SYNC_WINDOW);
+                }
+                sync_messages.extend(msgs);
+            }
+        }
         self.emit_delta(StateDelta::Sync {
-            messages: state.messages.clone(),
+            messages: sync_messages,
+            has_more,
         });
 
         while let Some(cmd) = rx.recv().await {
@@ -650,6 +699,40 @@ impl AppState {
                             }
                         }
                     }
+                    Event::FileServeFailed {
+                        to,
+                        packet_no,
+                        file_id,
+                        ..
+                    } => {
+                        let to_norm = normalize_addr(to);
+                        for message in state.messages.iter_mut().rev() {
+                            if !message.is_me || normalize_addr(message.to) != to_norm {
+                                continue;
+                            }
+                            if let Some(file) = &mut message.file
+                                && file.packet_no == packet_no
+                                && file.file_id == file_id
+                            {
+                                // 对端中止接收等导致发送中断：从"发送中"转为失败。
+                                // 我方主动取消（cancel_upload 已置 canceled）时此事件
+                                // 不会发出，这里仍加 canceled 守卫防竞态。
+                                if !file.canceled {
+                                    file.sending = false;
+                                    file.saved = false;
+                                    file.error = true;
+                                    changed = true;
+                                    should_persist = true;
+                                    updated_message = Some(message.clone());
+                                    log::info!(
+                                        "FileServeFailed -> error set, to_norm={} pkt={:x} fid={:x}",
+                                        to_norm, packet_no, file_id
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
                     Event::Delivered { from, packet_no } => {
                         // Peer's RECVMSG: delivery confirmation for an outgoing
                         // message/file offer with the given packet_no.
@@ -684,9 +767,10 @@ impl AppState {
                     _ => {}
                 },
                 StateCmd::PushOutgoing(mut msg) => {
-                    if msg.id == 0 {
-                        msg.id = self.next_message_id();
-                    }
+                    // 所有调用方（logic.rs）都传 id=0，此处无条件分配；与历史
+                    // 加载、收到的消息/文件共用同一计数器，actor 单任务内顺序
+                    // 执行，id 天然不重不漏。
+                    msg.id = self.next_message_id();
                     // Race guard: the peer's RECVMSG can be processed by the event
                     // pump before this task dispatches PushOutgoing, in which case
                     // the ack was recorded in acked_packets with no message to
@@ -787,6 +871,28 @@ impl AppState {
                         changed = true;
                     }
                 }
+                StateCmd::LoadMore {
+                    addr,
+                    before_id,
+                    limit,
+                } => {
+                    let addr_norm = normalize_addr(addr);
+                    // state.messages 按插入顺序（id 递增），过滤保序，取最旧侧
+                    // 的最近 limit 条；只改增量、不触快照/持久化。
+                    let older: Vec<ChatMessage> = state
+                        .messages
+                        .iter()
+                        .filter(|m| message_peer_addr(m) == addr_norm && m.id < before_id)
+                        .cloned()
+                        .collect();
+                    let has_more = older.len() > limit;
+                    let start = older.len().saturating_sub(limit);
+                    self.emit_delta(StateDelta::MessagesLoaded {
+                        addr: addr_norm,
+                        messages: older[start..].to_vec(),
+                        has_more,
+                    });
+                }
                 StateCmd::RetryFinished {
                     id,
                     ok,
@@ -859,6 +965,15 @@ fn legacy_history_path() -> PathBuf {
 
 fn normalize_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip(), PORT)
+}
+
+/// 消息所属会话：发出的看 `to`，收到的看 `from`（与 chat_shell::peer_addr 一致）。
+fn message_peer_addr(m: &ChatMessage) -> SocketAddr {
+    if m.is_me {
+        m.to
+    } else {
+        m.from
+    }
 }
 
 fn default_self_addr() -> SocketAddr {
