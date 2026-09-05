@@ -14,11 +14,17 @@ impl ChatShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let current_name = self
-            .selected_conversation()
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| t!("app.conversation").to_string());
-        let messages = self.messages_for_selected();
+        let (current_name, messages) = {
+            let ui = self.ui_state.read(cx);
+            let conv = self.selected_id.as_ref().and_then(|id| ui.conversation(id));
+            let name = conv
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| t!("app.conversation").to_string());
+            let messages = conv
+                .map(|c| ui.messages_for(&c.id).to_vec())
+                .unwrap_or_default();
+            (name, messages)
+        };
         let peer_avatar = current_name
             .chars()
             .next()
@@ -49,7 +55,64 @@ impl ChatShell {
                 );
             }
 
-            if let Some(transfer) = &message.file {
+            if message.failed {
+                if let Some(f) = &message.file {
+                    let fname = if f.is_dir {
+                        t!("file.folder_prefix", name = f.name.clone()).to_string()
+                    } else {
+                        t!("file.file_prefix", name = f.name.clone()).to_string()
+                    };
+                    bubble = bubble.child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(fname),
+                    );
+                }
+                let message_for_click = message.clone();
+                bubble = bubble
+                    .border_1()
+                    .border_color(theme.danger)
+                    .child(
+                        div()
+                            .mt_1()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.danger)
+                                    .child(t!("transfer.send_failed").to_string()),
+                            )
+                            .child(
+                                Button::new(format!("retry-{}", message.id))
+                                    .xsmall()
+                                    .primary()
+                                    .label(t!("chat.retry").to_string())
+                                    .on_click(cx.listener(move |this, _, _, _cx| {
+                                        this.retry_message(message_for_click.clone());
+                                    })),
+                            ),
+                    );
+            } else if message.from_me && message.delivered {
+                bubble = bubble.child(
+                    div()
+                        .mt_1()
+                        .h_flex()
+                        .items_center()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.success)
+                                .child(t!("transfer.delivered").to_string()),
+                        ),
+                );
+            }
+
+            if !message.failed && let Some(transfer) = &message.file {
                 let is_receiving = !transfer.saved
                     && !transfer.error
                     && !transfer.canceled

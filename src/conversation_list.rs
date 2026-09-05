@@ -11,9 +11,11 @@ impl ChatShell {
     pub(super) fn render_conversation_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let search = self.search_text.trim().to_lowercase();
+        let conversations = self.ui_state.read(cx).conversations().to_vec();
+        let selected_id = self.selected_id.clone();
 
         let mut list = div().v_flex().gap_1().px_2();
-        for (index, conv) in self.conversations.iter().enumerate() {
+        for conv in &conversations {
             if !search.is_empty() {
                 let haystack = format!("{} {}", conv.name.to_lowercase(), conv.subtitle.to_lowercase());
                 if !haystack.contains(&search) {
@@ -21,7 +23,7 @@ impl ChatShell {
                 }
             }
 
-            let is_selected = index == self.selected_conversation;
+            let is_selected = selected_id.as_ref() == Some(&conv.id);
             let avatar = conv
                 .name
                 .chars()
@@ -29,6 +31,7 @@ impl ChatShell {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "?".to_string());
             let unread_badge = conv.unread.to_string();
+            let conv_id = conv.id.clone();
 
             list = list.child(
                 div()
@@ -123,8 +126,7 @@ impl ChatShell {
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_conversation(index);
-                        cx.notify();
+                        this.select_conversation(conv_id.clone(), cx);
                     })),
             );
         }
@@ -142,7 +144,7 @@ impl ChatShell {
                     .child(Input::new(&self.search_input).small())
                     .child(Button::new("new-chat").small().label("+")),
             )
-            .when(self.search_text.trim().is_empty() && self.conversations.is_empty(), |this| {
+            .when(self.search_text.trim().is_empty() && conversations.is_empty(), |this| {
                 this.child(
                     div()
                         .px_3()

@@ -107,11 +107,38 @@ fn split_extra(extra: &str) -> (String, Vec<String>) {
     (main, rest)
 }
 
+/// Validate a single path component received from the network before it ever
+/// touches the local filesystem. Rejects separators, parent references,
+/// drive/ADS colons, control characters and Windows reserved device names
+/// (P0-2 in docs/architecture.md).
+fn sanitize_wire_filename(name: &str) -> Option<&str> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || c == '/' || c == '\\' || c == ':')
+    {
+        return None;
+    }
+    let stem = name.split('.').next().unwrap_or("");
+    match stem.to_ascii_uppercase().as_str() {
+        "CON" | "PRN" | "AUX" | "NUL"
+        | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+        | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+            return None;
+        }
+        _ => {}
+    }
+    Some(name)
+}
+
 fn parse_entry_extra(username: &str, extra: &str) -> (String, String) {
     let mut iter = extra.split('\0');
     let nick = iter.next().unwrap_or("");
     let group = iter.next().unwrap_or("");
-    
+
     let clean_nick: String = nick.chars().filter(|c| !c.is_control()).collect();
     let clean_nick = clean_nick.trim();
     let final_nick = if !clean_nick.is_empty() {
@@ -122,10 +149,9 @@ fn parse_entry_extra(username: &str, extra: &str) -> (String, String) {
 
     let clean_group: String = group.chars().filter(|c| !c.is_control()).collect();
     let final_group = clean_group.trim().to_string();
-    
+
     (final_nick, final_group)
 }
-
 fn parse_u32_auto_radix(s: &str) -> u32 {
     let s = s.trim();
     if s.is_empty() {
@@ -192,6 +218,13 @@ pub enum Event {
         packet_no: u32,
         file_id: u32,
         is_dir: bool,
+    },
+    /// Peer's client acknowledged receiving our SENDMSG (IPMSG_RECVMSG).
+    /// `packet_no` is the id of the packet WE sent; matched against outgoing
+    /// text/file messages in the state layer.
+    Delivered {
+        from: SocketAddr,
+        packet_no: u32,
     },
     Unknown { from: SocketAddr, raw: String },
 }
@@ -267,6 +300,9 @@ fn build_user_extra() -> String {
 
 #[derive(Clone, Debug)]
 struct FileEntry {
+    /// IP of the peer this file was offered to. Any other requester is denied
+    /// (P0-3 in docs/architecture.md).
+    to: IpAddr,
     path: PathBuf,
     size: u64,
     is_dir: bool,
@@ -274,12 +310,26 @@ struct FileEntry {
 
 static FILE_TABLE: Lazy<Mutex<HashMap<(u32, u32), FileEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static FILE_ID_SEQ: AtomicU32 = AtomicU32::new(1);
 static PACKET_NO_SEQ: AtomicU32 = AtomicU32::new(1);
-static SEND_CANCEL_FLAGS: Lazy<Mutex<HashMap<(SocketAddr, u32, u32), Arc<AtomicBool>>>> =
+
+/// Identifies an in-flight outgoing transfer: destination host (IP only — the
+/// TCP peer connects from an ephemeral port), plus the offered packet/file ids.
+type CancelKey = (IpAddr, u32, u32);
+static SEND_CANCEL_FLAGS: Lazy<Mutex<HashMap<CancelKey, Arc<AtomicBool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn send_cancel_token(peer: SocketAddr, packet_no: u32, file_id: u32) -> Arc<AtomicBool> {
+/// Random, unguessable file transfer id (sequential ids were trivially
+/// enumerable by any LAN host).
+///
+/// MUST stay below 0x8000_0000: peers parse ids with *signed* 32-bit
+/// arithmetic, so values >= 2^31 overflow (strtol ERANGE) and the whole file
+/// entry becomes unreceivable on original IPMsg clients. Same constraint as
+/// packet_no — see commit ea4320f "fileid兼容32位".
+fn random_file_id() -> u32 {
+    rand::random::<u32>() & 0x7fff_ffff
+}
+
+fn send_cancel_token(peer: IpAddr, packet_no: u32, file_id: u32) -> Arc<AtomicBool> {
     let mut flags = SEND_CANCEL_FLAGS.lock().unwrap();
     flags
         .entry((peer, packet_no, file_id))
@@ -287,7 +337,7 @@ fn send_cancel_token(peer: SocketAddr, packet_no: u32, file_id: u32) -> Arc<Atom
         .clone()
 }
 
-fn clear_send_cancel_token(peer: SocketAddr, packet_no: u32, file_id: u32) {
+fn clear_send_cancel_token(peer: IpAddr, packet_no: u32, file_id: u32) {
     SEND_CANCEL_FLAGS
         .lock()
         .unwrap()
@@ -296,7 +346,7 @@ fn clear_send_cancel_token(peer: SocketAddr, packet_no: u32, file_id: u32) {
 
 pub fn cancel_send(to: SocketAddr, packet_no: u32, file_id: u32) -> bool {
     let removed = FILE_TABLE.lock().unwrap().remove(&(packet_no, file_id)).is_some();
-    let token = send_cancel_token(to, packet_no, file_id);
+    let token = send_cancel_token(to.ip(), packet_no, file_id);
     token.store(true, Ordering::SeqCst);
     removed
 }
@@ -448,7 +498,13 @@ impl Service {
                                             p.packet_no, p.username, p.hostname, from, main
                                         );
                                         if addr_allowed(&from) {
-                                            let _ = tx_udp.send(Event::Unknown { from, raw: String::from_utf8_lossy(data).to_string() });
+                                            // main is the packet_no of the SENDMSG we sent to this
+                                            // peer; deliver it as a delivery confirmation.
+                                            let acked = parse_u32_auto_radix(&main);
+                                            let _ = tx_udp.send(Event::Delivered {
+                                                from,
+                                                packet_no: acked,
+                                            });
                                         }
                                     }
                                     IPMSG_NOOPERATION => {
@@ -852,7 +908,9 @@ pub async fn send_exit_to(to: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-pub async fn send_message(to: SocketAddr, text: String) -> Result<()> {
+/// Send a text message; returns the packet_no used, which the peer echoes
+/// back in RECVMSG so the caller can track delivery status.
+pub async fn send_message(to: SocketAddr, text: String) -> Result<u32> {
     let socket = {
         MAIN_SOCKET.lock().unwrap().as_ref().cloned()
     };
@@ -884,7 +942,7 @@ pub async fn send_message(to: SocketAddr, text: String) -> Result<()> {
         "SENDMSG sent id={} to {} text='{}'",
         packet.packet_no, to, packet.extra
     );
-    Ok(())
+    Ok(packet.packet_no)
 }
 
 pub async fn send_file(to: SocketAddr, path: String) -> Result<()> {
@@ -919,14 +977,22 @@ pub async fn send_file(to: SocketAddr, path: String) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("file")
         .replace(':', "::");
-    let file_id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    let file_id = if file_id == u32::MAX { 1 } else { file_id };
+    let file_id = loop {
+        let id = random_file_id();
+        if id != 0 {
+            break id;
+        }
+    };
     let packet_no = now_millis();
     {
         let mut table = FILE_TABLE.lock().unwrap();
+        if table.contains_key(&(packet_no, file_id)) {
+            return Err(anyhow!("file id collision, retry transfer"));
+        }
         table.insert(
             (packet_no, file_id),
             FileEntry {
+                to: to.ip(),
                 path: PathBuf::from(&path),
                 size: file_size,
                 is_dir: false,
@@ -936,8 +1002,10 @@ pub async fn send_file(to: SocketAddr, path: String) -> Result<()> {
     let size_hex = format!("{:x}", file_size);
     let mtime_hex = format!("{:x}", mtime);
     let attr_hex = format!("{:x}", IPMSG_FILE_REGULAR);
+    // Per spec, only size/mtime/fileattr are hex; fileID is decimal
+    // (protocol.txt §5, draft 14).
     let file_info = format!(
-        "{:x}:{}:{}:{}:{}:\x07",
+        "{}:{}:{}:{}:{}:\x07",
         file_id, file_name, size_hex, mtime_hex, attr_hex
     );
     let mut extra = String::new();
@@ -995,57 +1063,57 @@ pub async fn send_files(to: SocketAddr, paths: Vec<String>) -> Result<Vec<SentFi
 
     let packet_no = now_millis();
     let mut file_infos = String::new();
-    let mut table_entries = Vec::new();
     let mut sent_items = Vec::new();
-
-    for (path, meta) in valid_files.iter() {
-        let file_size = meta.len();
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let file_name = PathBuf::from(path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
-            .replace(':', "::");
-        
-        let file_id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-        let file_id = if file_id == u32::MAX { 1 } else { file_id };
-
-        table_entries.push((file_id, path.clone(), file_size));
-        sent_items.push(SentFileMeta {
-            packet_no,
-            file_id,
-            path: path.clone(),
-            name: file_name.clone(),
-            size: file_size,
-            is_dir: false,
-        });
-
-        let size_hex = format!("{:x}", file_size);
-        let mtime_hex = format!("{:x}", mtime);
-        let attr_hex = format!("{:x}", IPMSG_FILE_REGULAR);
-        let info = format!(
-            "{:x}:{}:{}:{}:{}:\x07",
-            file_id, file_name, size_hex, mtime_hex, attr_hex
-        );
-        file_infos.push_str(&info);
-    }
 
     {
         let mut table = FILE_TABLE.lock().unwrap();
-        for (fid, p, s) in table_entries {
-             table.insert(
-                (packet_no, fid),
+        for (path, meta) in valid_files.iter() {
+            let file_size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let file_name = PathBuf::from(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file")
+                .replace(':', "::");
+
+            let file_id = loop {
+                let id = random_file_id();
+                if id != 0 && !table.contains_key(&(packet_no, id)) {
+                    break id;
+                }
+            };
+
+            table.insert(
+                (packet_no, file_id),
                 FileEntry {
-                    path: PathBuf::from(&p),
-                    size: s,
+                    to: to.ip(),
+                    path: PathBuf::from(path),
+                    size: file_size,
                     is_dir: false,
                 },
             );
+            sent_items.push(SentFileMeta {
+                packet_no,
+                file_id,
+                path: path.clone(),
+                name: file_name.clone(),
+                size: file_size,
+                is_dir: false,
+            });
+
+            let size_hex = format!("{:x}", file_size);
+            let mtime_hex = format!("{:x}", mtime);
+            let attr_hex = format!("{:x}", IPMSG_FILE_REGULAR);
+            let info = format!(
+                "{}:{}:{}:{}:{}:\x07",
+                file_id, file_name, size_hex, mtime_hex, attr_hex
+            );
+            file_infos.push_str(&info);
         }
     }
 
@@ -1104,14 +1172,22 @@ pub async fn send_folder(to: SocketAddr, dir: String) -> Result<SentFileMeta> {
         .and_then(|s| s.to_str())
         .unwrap_or("dir")
         .replace(':', "::");
-    let file_id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    let file_id = if file_id == u32::MAX { 1 } else { file_id };
+    let file_id = loop {
+        let id = random_file_id();
+        if id != 0 {
+            break id;
+        }
+    };
     let packet_no = now_millis();
     {
         let mut table = FILE_TABLE.lock().unwrap();
+        if table.contains_key(&(packet_no, file_id)) {
+            return Err(anyhow!("file id collision, retry transfer"));
+        }
         table.insert(
             (packet_no, file_id),
             FileEntry {
+                to: to.ip(),
                 path: PathBuf::from(&dir),
                 size: 0,
                 is_dir: true,
@@ -1122,7 +1198,7 @@ pub async fn send_folder(to: SocketAddr, dir: String) -> Result<SentFileMeta> {
     let mtime_hex = format!("{:x}", mtime);
     let attr_hex = format!("{:x}", IPMSG_FILE_DIR);
     let file_info = format!(
-        "{:x}:{}:{}:{}:{}:\x07",
+        "{}:{}:{}:{}:{}:\x07",
         file_id, dir_name, size_hex, mtime_hex, attr_hex
     );
     let text = format!("[文件夹] {}", dir_name);
@@ -1361,6 +1437,12 @@ where
 
         match file_type {
             IPMSG_FILE_REGULAR => {
+                let Some(filename) = sanitize_wire_filename(filename) else {
+                    return Err(anyhow!(
+                        "refused unsafe filename in folder transfer: {:?}",
+                        header_str
+                    ));
+                };
                 if let Some(current_dir) = path_stack.last() {
                     let file_path = current_dir.join(filename);
                     let mut file = fs::File::create(&file_path).await?;
@@ -1393,6 +1475,12 @@ where
                     // This effectively maps the sender's root folder name to our local 'save_path'.
                     continue;
                 }
+                let Some(filename) = sanitize_wire_filename(filename) else {
+                    return Err(anyhow!(
+                        "refused unsafe directory name in folder transfer: {:?}",
+                        header_str
+                    ));
+                };
                 if let Some(current_dir) = path_stack.last() {
                     let dir_path = current_dir.join(filename);
                     if !dir_path.exists() {
@@ -1502,6 +1590,12 @@ fn send_dir_children<'a>(
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("file");
+                // Never emit entries whose name we would refuse on the receive
+                // side (e.g. NTFS alternate data streams like "f.txt:ads").
+                if sanitize_wire_filename(name).is_none() {
+                    warn!("skip sending entry with unsafe name: {:?}", path);
+                    continue;
+                }
                 let size = meta.len();
                 write_dir_header(stream, name, IPMSG_FILE_REGULAR, size, mtime).await?;
                 let mut file = fs::File::open(&path).await?;
@@ -1552,6 +1646,42 @@ async fn send_dir_hierarchy(
     Ok(())
 }
 
+/// Peers echo packet/file ids in GETFILEDATA/GETDIRFILES with different
+/// radices: the spec mandates hex, but several Chinese clients (飞鸽/飞秋等)
+/// use decimal. Resolve against the file table instead of trusting one radix.
+fn lookup_file_entry(
+    table: &HashMap<(u32, u32), FileEntry>,
+    pkt_no: &str,
+    file_id: &str,
+) -> Option<(u32, u32, FileEntry)> {
+    let mut candidates: Vec<Vec<u32>> = Vec::with_capacity(2);
+    for s in [pkt_no, file_id] {
+        let s = s.trim();
+        let mut vals: Vec<u32> = Vec::new();
+        if let Ok(v) = u32::from_str_radix(s, 16) {
+            vals.push(v);
+        }
+        if let Ok(v) = s.parse::<u32>()
+            && !vals.contains(&v)
+        {
+            vals.push(v);
+        }
+        let auto = parse_u32_auto_radix(s);
+        if !vals.contains(&auto) {
+            vals.push(auto);
+        }
+        candidates.push(vals);
+    }
+    for a in &candidates[0] {
+        for b in &candidates[1] {
+            if let Some(entry) = table.get(&(*a, *b)) {
+                return Some((*a, *b, entry.clone()));
+            }
+        }
+    }
+    None
+}
+
 async fn handle_tcp_file(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -1571,22 +1701,33 @@ async fn handle_tcp_file(
         if parts.len() < 3 {
             return Err(anyhow!("bad GETFILEDATA extra"));
         }
-        let pkt_no = u32::from_str_radix(parts[0], 16).unwrap_or(0);
-        let file_id = u32::from_str_radix(parts[1], 16).unwrap_or(0);
-        let offset = u64::from_str_radix(parts[2], 16).unwrap_or(0);
-        let entry = {
+        let (pkt_no, file_id, entry) = {
             let table = FILE_TABLE.lock().unwrap();
             info!("handle_tcp_file table={:?}", table);
-            table.get(&(pkt_no, file_id)).cloned()
+            match lookup_file_entry(&table, parts[0], parts[1]) {
+                Some((p, f, e)) => (p, f, Some(e)),
+                None => (0, 0, None),
+            }
         };
+        let offset = parse_u64_auto_radix(parts[2].trim());
         info!("handle_tcp_file packet_no={:x} file_id={:x} offset={:x} {:?}", pkt_no, file_id, offset, entry);
         if let Some(entry) = entry {
+            // Only the peer the file was offered to may download it (P0-3).
+            // Compare by IP: the TCP client connects from an ephemeral port,
+            // so full socket equality never matches.
+            if entry.to != peer_addr.ip() {
+                warn!(
+                    "denied GETFILEDATA ({:x},{:x}) from {}: not intended recipient {:?}",
+                    pkt_no, file_id, peer_addr.ip(), entry.to
+                );
+                return Err(anyhow!("file request not authorized"));
+            }
             if entry.is_dir {
                 return Ok(());
             }
-            let cancel_token = send_cancel_token(peer_addr, pkt_no, file_id);
+            let cancel_token = send_cancel_token(peer_addr.ip(), pkt_no, file_id);
             if cancel_token.load(Ordering::SeqCst) {
-                clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
                 return Err(anyhow!("send canceled"));
             }
             let _ = tx.send(Event::FileServingStarted {
@@ -1615,7 +1756,7 @@ async fn handle_tcp_file(
             }
             .await;
             if let Err(err) = send_result {
-                clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
                 return Err(err);
             }
             info!(
@@ -1630,7 +1771,7 @@ async fn handle_tcp_file(
                 file_id,
                 is_dir: false,
             });
-            clear_send_cancel_token(peer_addr, pkt_no, file_id);
+            clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
         }
         return Ok(());
     }
@@ -1639,22 +1780,31 @@ async fn handle_tcp_file(
         if parts.len() < 2 {
             return Err(anyhow!("bad GETDIRFILES extra"));
         }
-        let pkt_no = u32::from_str_radix(parts[0], 16).unwrap_or(0);
-        let file_id = u32::from_str_radix(parts[1], 16).unwrap_or(0);
+        let (pkt_no, file_id, entry) = {
+            let table = FILE_TABLE.lock().unwrap();
+            match lookup_file_entry(&table, parts[0], parts[1]) {
+                Some((p, f, e)) => (p, f, Some(e)),
+                None => (0, 0, None),
+            }
+        };
         let _offset = if parts.len() >= 3 {
-            u64::from_str_radix(parts[2], 16).unwrap_or(0)
+            parse_u64_auto_radix(parts[2].trim())
         } else {
             0
         };
-        let entry = {
-            let table = FILE_TABLE.lock().unwrap();
-            table.get(&(pkt_no, file_id)).cloned()
-        };
         if let Some(entry) = entry {
+            // Only the peer the file was offered to may download it (P0-3).
+            if entry.to != peer_addr.ip() {
+                warn!(
+                    "denied GETDIRFILES ({:x},{:x}) from {}: not intended recipient {:?}",
+                    pkt_no, file_id, peer_addr.ip(), entry.to
+                );
+                return Err(anyhow!("file request not authorized"));
+            }
             if entry.is_dir {
-                let cancel_token = send_cancel_token(peer_addr, pkt_no, file_id);
+                let cancel_token = send_cancel_token(peer_addr.ip(), pkt_no, file_id);
                 if cancel_token.load(Ordering::SeqCst) {
-                    clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                    clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
                     return Err(anyhow!("send canceled"));
                 }
                 let _ = tx.send(Event::FileServingStarted {
@@ -1666,7 +1816,7 @@ async fn handle_tcp_file(
                 let send_result =
                     send_dir_hierarchy(&mut stream, &entry.path, cancel_token.clone()).await;
                 if let Err(err) = send_result {
-                    clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                    clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
                     return Err(err);
                 }
                 info!(
@@ -1681,7 +1831,7 @@ async fn handle_tcp_file(
                     file_id,
                     is_dir: true,
                 });
-                clear_send_cancel_token(peer_addr, pkt_no, file_id);
+                clear_send_cancel_token(peer_addr.ip(), pkt_no, file_id);
             }
         }
     }
@@ -1696,4 +1846,62 @@ pub async fn start_ipmsg() -> Result<(broadcast::Receiver<Event>, u16)> {
     let port = service.port;
     service.spawn().await?;
     Ok((rx, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Peers (original IPMsg and clones) parse wire ids with *signed* 32-bit
+    /// arithmetic. Regression guard for the "fileid兼容32位" constraint.
+    #[test]
+    fn random_file_id_stays_in_signed_32bit_range() {
+        for _ in 0..10_000 {
+            let id = random_file_id();
+            assert_ne!(id, 0);
+            assert!(
+                id < 0x8000_0000,
+                "file_id {id:#x} overflows signed 32-bit parse on peers"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_rejects_path_traversal_and_device_names() {
+        assert!(sanitize_wire_filename("..\\..\\evil.exe").is_none());
+        assert!(sanitize_wire_filename("../../evil").is_none());
+        assert!(sanitize_wire_filename("C:\\evil").is_none());
+        assert!(sanitize_wire_filename("f.txt:ads").is_none());
+        assert!(sanitize_wire_filename("..").is_none());
+        assert!(sanitize_wire_filename("").is_none());
+        assert!(sanitize_wire_filename("CON").is_none());
+        assert_eq!(sanitize_wire_filename("normal.txt"), Some("normal.txt"));
+        assert_eq!(sanitize_wire_filename("中文文件.pdf"), Some("中文文件.pdf"));
+    }
+
+    /// GETFILEDATA/GETDIRFILES ids arrive in hex (spec) or decimal (several
+    /// Chinese clients). The lookup must resolve either against the table.
+    #[test]
+    fn lookup_file_entry_resolves_hex_and_decimal_echo() {
+        let mut table = HashMap::new();
+        table.insert(
+            (34, 271_038_928),
+            FileEntry {
+                to: "192.168.68.245".parse().unwrap(),
+                path: PathBuf::from("bevy_game_1.zip"),
+                size: 45_000_000,
+                is_dir: false,
+            },
+        );
+        // Spec-compliant peer echoes hex: "22:1027b9d0"
+        let hit = lookup_file_entry(&table, "22", "1027b9d0").expect("hex echo must resolve");
+        assert_eq!(hit.0, 34);
+        assert_eq!(hit.1, 271_038_928);
+        // Decimal echo: "34:271038928"
+        let hit = lookup_file_entry(&table, "34", "271038928").expect("decimal echo must resolve");
+        assert_eq!(hit.0, 34);
+        assert_eq!(hit.1, 271_038_928);
+        // Unknown ids must not resolve
+        assert!(lookup_file_entry(&table, "99", "999").is_none());
+    }
 }

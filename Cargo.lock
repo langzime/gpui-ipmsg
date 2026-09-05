@@ -2375,6 +2375,7 @@ dependencies = [
  "hostname",
  "log",
  "once_cell",
+ "rand 0.9.4",
  "rfd",
  "rust-i18n",
  "serde",

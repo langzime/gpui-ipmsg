@@ -8,6 +8,7 @@ chat:
   cancel_receive: "Cancel Receive"
   cancel_send: "Cancel Send"
   open_in_folder: "Open in Folder"
+  retry: "Retry"
   no_conversations: "No conversations"
 file:
   folder_prefix: "[Folder] %{name}"
@@ -16,6 +17,7 @@ file:
 transfer:
   canceled: "Canceled"
   send_failed: "Send failed"
+  delivered: "Delivered"
   sent: "Sent"
   sending: "Sending"
   waiting_peer: "Waiting for peer"

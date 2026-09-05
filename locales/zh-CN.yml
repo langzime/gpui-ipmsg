@@ -8,6 +8,7 @@ chat:
   cancel_receive: "取消接收"
   cancel_send: "取消发送"
   open_in_folder: "在文件夹中打开"
+  retry: "重试"
   no_conversations: "暂无会话"
 file:
   folder_prefix: "[文件夹] %{name}"
@@ -16,6 +17,7 @@ file:
 transfer:
   canceled: "已取消"
   send_failed: "发送失败"
+  delivered: "已送达"
   sent: "已发送"
   sending: "发送中"
   waiting_peer: "待对方接收"

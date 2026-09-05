@@ -23,6 +23,20 @@ fn download_key(from: SocketAddr, packet_no: u32, file_id: u32) -> String {
     format!("{}-{}-{}", from, packet_no, file_id)
 }
 
+/// Best-effort name/size/dir classification of a local path, used to render
+/// and retry failed file offers.
+fn file_meta(path: &str) -> (String, u64, bool) {
+    let p = PathBuf::from(path);
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let meta = std::fs::metadata(&p).ok();
+    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let size = meta.map(|m| m.len()).unwrap_or(0);
+    (name, size, is_dir)
+}
+
 pub fn ensure_started() {
     if STARTED.get().is_some() {
         return;
@@ -42,6 +56,20 @@ pub fn ensure_started() {
     });
 }
 
+/// Graceful shutdown: broadcast BR_EXIT so peers drop us from their user
+/// lists immediately, then exit. `process::exit` is still required because
+/// GPUI keeps the process alive after the last window closes on some
+/// platforms, but it now runs only after the offline broadcast was sent
+/// (P0-4 in docs/architecture.md).
+pub fn shutdown() {
+    if let Some(handle) = RUNTIME_HANDLE.get() {
+        handle.block_on(async {
+            let _ = ipmsg_core::send_exit().await;
+        });
+    }
+    std::process::exit(0);
+}
+
 pub fn send_text(to: SocketAddr, text: String) {
     if text.trim().is_empty() {
         return;
@@ -51,18 +79,24 @@ pub fn send_text(to: SocketAddr, text: String) {
     };
 
     handle.spawn(async move {
-        if ipmsg_core::send_message(to, text.clone()).await.is_ok() {
-            if let Some(me) = app_state::get_self_addr_info() {
-                let msg = ChatMessage {
-                    from: me.addr,
-                    to,
-                    is_me: true,
-                    text,
-                    time: t!("time.now").to_string(),
-                    file: None,
-                };
-                app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
-            }
+        let sent = ipmsg_core::send_message(to, text.clone()).await;
+        if let Err(err) = &sent {
+            log::warn!("send_message to {} failed: {}", to, err);
+        }
+        if let Some(me) = app_state::get_self_addr_info() {
+            let msg = ChatMessage {
+                from: me.addr,
+                to,
+                is_me: true,
+                text,
+                time: t!("time.now").to_string(),
+                file: None,
+                failed: sent.is_err(),
+                packet_no: sent.unwrap_or(0),
+                delivered: false,
+                id: 0,
+            };
+            app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
         }
     });
 }
@@ -76,31 +110,75 @@ pub fn send_files(to: SocketAddr, paths: Vec<String>) {
     };
 
     handle.spawn(async move {
-        if let Ok(sent_items) = ipmsg_core::send_files(to, paths.clone()).await {
-            if let Some(me) = app_state::get_self_addr_info() {
-                for item in sent_items {
-                    let msg = ChatMessage {
-                        from: me.addr,
-                        to,
-                        is_me: true,
-                        text: String::new(),
-                        time: t!("time.now").to_string(),
-                        file: Some(app_state::FileInfo {
+        let send_result = ipmsg_core::send_files(to, paths.clone()).await;
+        if let Err(err) = &send_result {
+            log::warn!("send_files to {} failed: {}", to, err);
+        }
+        if let Some(me) = app_state::get_self_addr_info() {
+            match send_result {
+                Ok(sent_items) => {
+                    for item in sent_items {
+                        let msg = ChatMessage {
+                            from: me.addr,
+                            to,
+                            is_me: true,
+                            text: String::new(),
+                            time: t!("time.now").to_string(),
+                            file: Some(app_state::FileInfo {
+                                packet_no: item.packet_no,
+                                file_id: item.file_id,
+                                name: item.name,
+                                size: item.size,
+                                saved: false,
+                                received: 0,
+                                is_dir: false,
+                                local_path: Some(item.path),
+                                current_file: None,
+                                error: false,
+                                canceled: false,
+                                sending: false,
+                            }),
+                            failed: false,
                             packet_no: item.packet_no,
-                            file_id: item.file_id,
-                            name: item.name,
-                            size: item.size,
-                            saved: false,
-                            received: 0,
-                            is_dir: false,
-                            local_path: Some(item.path),
-                            current_file: None,
-                            error: false,
-                            canceled: false,
-                            sending: false,
-                        }),
-                    };
-                    app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
+                            delivered: false,
+                            id: 0,
+                        };
+                        app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
+                    }
+                }
+                Err(_) => {
+                    // send_files is all-or-nothing (one SENDMSG for the batch),
+                    // so every path failed. Surface one retryable failed bubble
+                    // per path (P0-5 in docs/architecture.md).
+                    for path in &paths {
+                        let (name, size, is_dir) = file_meta(path);
+                        let msg = ChatMessage {
+                            from: me.addr,
+                            to,
+                            is_me: true,
+                            text: String::new(),
+                            time: t!("time.now").to_string(),
+                            file: Some(app_state::FileInfo {
+                                packet_no: 0,
+                                file_id: 0,
+                                name,
+                                size,
+                                saved: false,
+                                received: 0,
+                                is_dir,
+                                local_path: Some(path.clone()),
+                                current_file: None,
+                                error: false,
+                                canceled: false,
+                                sending: false,
+                            }),
+                            failed: true,
+                            packet_no: 0,
+                            delivered: false,
+                            id: 0,
+                        };
+                        app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
+                    }
                 }
             }
         }
@@ -116,9 +194,13 @@ pub fn send_folder(to: SocketAddr, path: String) {
     };
 
     handle.spawn(async move {
-        if let Ok(item) = ipmsg_core::send_folder(to, path.clone()).await {
-            if let Some(me) = app_state::get_self_addr_info() {
-                let msg = ChatMessage {
+        let send_result = ipmsg_core::send_folder(to, path.clone()).await;
+        if let Err(err) = &send_result {
+            log::warn!("send_folder to {} failed: {}", to, err);
+        }
+        if let Some(me) = app_state::get_self_addr_info() {
+            let msg = match send_result {
+                Ok(item) => ChatMessage {
                     from: me.addr,
                     to,
                     is_me: true,
@@ -138,10 +220,89 @@ pub fn send_folder(to: SocketAddr, path: String) {
                         canceled: false,
                         sending: false,
                     }),
-                };
-                app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
-            }
+                    failed: false,
+                    packet_no: item.packet_no,
+                    delivered: false,
+                    id: 0,
+                },
+                Err(_) => {
+                    // Keep the local path so the failed bubble can offer retry.
+                    let name = PathBuf::from(&path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    ChatMessage {
+                        from: me.addr,
+                        to,
+                        is_me: true,
+                        text: String::new(),
+                        time: t!("time.now").to_string(),
+                        file: Some(app_state::FileInfo {
+                            packet_no: 0,
+                            file_id: 0,
+                            name,
+                            size: 0,
+                            saved: false,
+                            received: 0,
+                            is_dir: true,
+                            local_path: Some(path),
+                            current_file: None,
+                            error: false,
+                            canceled: false,
+                            sending: false,
+                        }),
+                        failed: true,
+                        packet_no: 0,
+                        delivered: false,
+                        id: 0,
+                    }
+                }
+            };
+            app_state::dispatch_cmd(StateCmd::PushOutgoing(msg));
         }
+    });
+}
+
+/// Retry a failed outgoing message: text is re-sent via SENDMSG, a file/folder
+/// offer is re-advertised from its local path. The state layer updates the
+/// original bubble on success (StateCmd::RetryFinished).
+pub fn retry_message(id: u64, to: SocketAddr, text: String, file: Option<(String, bool)>) {
+    let Some(handle) = RUNTIME_HANDLE.get() else {
+        return;
+    };
+    handle.spawn(async move {
+        let (ok, packet_no, file_id) = if let Some((path, is_dir)) = file {
+            let send_result = if is_dir {
+                ipmsg_core::send_folder(to, path)
+                    .await
+                    .map(|item| vec![item])
+            } else {
+                ipmsg_core::send_files(to, vec![path]).await
+            };
+            match send_result {
+                Ok(mut items) if !items.is_empty() => {
+                    let item = items.remove(0);
+                    (true, item.packet_no, item.file_id)
+                }
+                Err(err) => {
+                    log::warn!("retry send file to {} failed: {}", to, err);
+                    (false, 0, 0)
+                }
+                _ => (false, 0, 0),
+            }
+        } else {
+            let sent = ipmsg_core::send_message(to, text.clone()).await;
+            if let Err(err) = &sent {
+                log::warn!("retry send_message to {} failed: {}", to, err);
+            }
+            (sent.is_ok(), sent.unwrap_or(0), 0)
+        };
+        app_state::dispatch_cmd(StateCmd::RetryFinished {
+            id,
+            ok,
+            packet_no,
+            file_id,
+        });
     });
 }
 
@@ -417,6 +578,8 @@ pub fn save_settings(
             addr: me.addr,
         });
     }
+    // 通知 UI 刷新本地化文案（UI 语言可能已切换），替代原先的 config 轮询探测。
+    app_state::dispatch_cmd(StateCmd::SettingsSaved);
 
     Ok(())
 }
